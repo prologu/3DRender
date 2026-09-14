@@ -6,13 +6,16 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "vite build",
-    "preview": "vite preview --host 0.0.0.0"
+    "preview": "vite preview --host 0.0.0.0",
+    "test:client": "node tests/smoke.cjs",
+    "test:server": "node tests/server-smoke.cjs"
   },
   "dependencies": {
     "@mkkellogg/gaussian-splats-3d": "0.4.7",
     "three": "0.170.0"
   },
   "devDependencies": {
+    "playwright-core": "1.62.1",
     "vite": "7.1.7"
   }
 }

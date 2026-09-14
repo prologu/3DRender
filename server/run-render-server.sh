@@ -16,6 +16,8 @@ args=(
   --physical-gpu "$PHYSICAL_GPU"
   --memory-fraction "${MEMORY_FRACTION:-0.045}"
   --min-free-mib "${MIN_FREE_MIB:-1750}"
+  --max-sessions "${MAX_SESSIONS:-4}"
+  --session-ttl "${SESSION_TTL:-120}"
   --upload-dir "$APP_ROOT/uploads"
 )
 

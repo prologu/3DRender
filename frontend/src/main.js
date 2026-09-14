@@ -1,5 +1,6 @@
 import './styles.css';
-import * as GaussianSplats3D from '@mkkellogg/gaussian-splats-3d';
+
+let GaussianSplats3D = null;
 
 const $ = (selector) => document.querySelector(selector);
 const els = {
@@ -17,12 +18,12 @@ const els = {
   renderModeLabel: $('#renderModeLabel'), privacyTitle: $('#privacyTitle'), privacyText: $('#privacyText')
 };
 
-const formats = {
-  ply: GaussianSplats3D.SceneFormat.Ply,
-  splat: GaussianSplats3D.SceneFormat.Splat,
-  ksplat: GaussianSplats3D.SceneFormat.KSplat,
-  spz: GaussianSplats3D.SceneFormat.Spz
-};
+const clientFormats = new Set(['ply', 'splat', 'ksplat', 'spz']);
+
+async function loadClientRenderer() {
+  if (!GaussianSplats3D) GaussianSplats3D = await import('@mkkellogg/gaussian-splats-3d');
+  return GaussianSplats3D;
+}
 
 let viewer = null;
 let objectUrl = null;
@@ -36,6 +37,14 @@ let serverFrameUrl = null;
 let serverStatus = null;
 let serverRequestRunning = false;
 let serverRequestPending = false;
+let serverSession = null;
+let serverSupportsStream = false;
+let serverUpdateRunning = false;
+let serverUpdatePending = null;
+let serverSettleTimer = null;
+let serverMetricsTimer = null;
+let streamedFrames = 0;
+let streamFpsStartedAt = performance.now();
 let serverDrag = null;
 const serverCamera = { yaw: 0, pitch: 0, distance: 6 };
 const apiPort = location.port === '18088' ? '18090' : '8090';
@@ -75,10 +84,23 @@ function backgroundRgb() {
   return [0, 2, 4].map((offset) => parseInt(hex.slice(offset, offset + 2), 16) / 255);
 }
 
-function serverResolution() {
+function serverResolution(interactive = false) {
+  if (interactive) return { width: 640, height: 360 };
   return els.qualitySelect.value === 'performance'
     ? { width: 800, height: 450 }
     : { width: 1280, height: 720 };
+}
+
+function serverRenderPayload(interactive = false) {
+  const performanceMode = els.qualitySelect.value === 'performance';
+  return {
+    ...serverCamera,
+    ...serverResolution(interactive),
+    background: backgroundRgb(),
+    fov: 55,
+    lod: interactive ? 'preview' : (performanceMode ? 'balanced' : 'full'),
+    jpeg_quality: interactive ? 72 : (performanceMode ? 82 : 90)
+  };
 }
 
 function updateModeUi() {
@@ -111,6 +133,7 @@ async function switchMode(mode) {
     els.viewport.classList.remove('ready');
     await connectServer();
   } else {
+    await closeServerSession();
     els.serverViewport.classList.remove('ready');
     els.serverFrame.removeAttribute('src');
     if (serverFrameUrl) URL.revokeObjectURL(serverFrameUrl);
@@ -148,11 +171,12 @@ async function connectServer() {
     const response = await fetch(`${API_BASE}/api/status`, { signal: AbortSignal.timeout(8000) });
     const status = await response.json();
     if (!response.ok || !status.ok) throw new Error(status.error || '服务不可用');
+    serverSupportsStream = Boolean(status.capabilities?.mjpeg_stream);
     els.webglBadge.classList.add('ok');
     els.webglBadge.lastChild.textContent = ` V100 就绪 · ${status.gpu.free_mib} MiB`;
     if (status.model) {
       applyServerModel(status.model);
-      await requestServerRender();
+      if (!await openServerSession()) await requestServerRender();
     } else {
       els.welcome.classList.remove('hidden');
       showToast('服务端已连接，请上传 PLY 模型');
@@ -197,24 +221,126 @@ async function finishServerUpload(error, model) {
   }
   setProgress(100);
   applyServerModel(model);
+  if (serverSupportsStream && !serverSession) await openServerSession();
   await requestServerRender();
   hideLoading();
   showToast(`${model.name} 已由 V100 加载`);
 }
 
-async function requestServerRender() {
+function updateStreamMetrics(stats) {
+  if (!stats) return;
+  const fps = stats.render_ms ? Math.round(1000 / stats.render_ms) : '—';
+  els.fpsValue.textContent = fps;
+  const lod = stats.gaussians ? ` · ${formatCount(stats.gaussians)} GS` : '';
+  els.serverMetrics.textContent = `${stats.width}×${stats.height}${lod} · ${stats.render_ms || '—'} ms · ${stats.peak_allocated_mib || '—'} MiB`;
+}
+
+async function closeServerSession() {
+  clearTimeout(serverSettleTimer);
+  clearInterval(serverMetricsTimer);
+  serverSettleTimer = null;
+  serverMetricsTimer = null;
+  serverUpdatePending = null;
+  const closingSession = serverSession;
+  serverSession = null;
+  els.serverFrame.removeAttribute('src');
+  if (closingSession) {
+    fetch(`${API_BASE}/api/session/${closingSession}`, {
+      method: 'DELETE', keepalive: true
+    }).catch(() => {});
+  }
+}
+
+async function pollServerMetrics() {
+  if (!serverSession) return;
+  try {
+    const response = await fetch(`${API_BASE}/api/session/${serverSession}`, {
+      signal: AbortSignal.timeout(3000), cache: 'no-store'
+    });
+    if (response.ok) updateStreamMetrics((await response.json()).stats);
+  } catch (_) { /* the image stream remains authoritative */ }
+}
+
+async function openServerSession() {
+  if (!serverSupportsStream || !serverStatus) return false;
+  await closeServerSession();
+  try {
+    const response = await fetch(`${API_BASE}/api/session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(serverRenderPayload(false))
+    });
+    if (!response.ok) return false;
+    const payload = await response.json();
+    serverSession = payload.session;
+    els.serverFrame.crossOrigin = 'anonymous';
+    els.serverFrame.onload = () => {
+      streamedFrames++;
+      const now = performance.now();
+      if (now - streamFpsStartedAt > 700) {
+        els.fpsValue.textContent = Math.max(1, Math.round(streamedFrames * 1000 / (now - streamFpsStartedAt)));
+        streamedFrames = 0;
+        streamFpsStartedAt = now;
+      }
+      els.serverViewport.classList.add('ready');
+    };
+    els.serverFrame.src = new URL(payload.stream_url, API_BASE).href;
+    serverMetricsTimer = setInterval(pollServerMetrics, 700);
+    return true;
+  } catch (_) {
+    serverSession = null;
+    return false;
+  }
+}
+
+async function updateServerSession(payload) {
+  serverUpdatePending = payload;
+  if (serverUpdateRunning || !serverSession) return;
+  serverUpdateRunning = true;
+  try {
+    while (serverUpdatePending && serverSession) {
+      const next = serverUpdatePending;
+      serverUpdatePending = null;
+      const response = await fetch(`${API_BASE}/api/session/${serverSession}/camera`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(next)
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    }
+  } catch (error) {
+    showToast(`帧流更新失败：${readableError(error)}`, true);
+  } finally {
+    serverUpdateRunning = false;
+    if (serverUpdatePending && serverSession) updateServerSession(serverUpdatePending);
+  }
+}
+
+function scheduleServerRender(interactive = false) {
+  clearTimeout(serverSettleTimer);
+  requestServerRender(interactive);
+  if (interactive) {
+    serverSettleTimer = setTimeout(() => requestServerRender(false), 140);
+  }
+}
+
+async function requestServerRender(interactive = false) {
   if (renderLocation !== 'server' || !serverStatus) return;
+  const request = serverRenderPayload(interactive);
+  if (serverSession) {
+    updateServerSession(request);
+    return;
+  }
   if (serverRequestRunning) {
     serverRequestPending = true;
     return;
   }
   serverRequestRunning = true;
-  const resolution = serverResolution();
   try {
     const response = await fetch(`${API_BASE}/api/render`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...serverCamera, ...resolution, background: backgroundRgb(), fov: 55 })
+      body: JSON.stringify(request)
     });
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}));
@@ -227,10 +353,7 @@ async function requestServerRender() {
       serverFrameUrl = nextUrl;
     };
     els.serverFrame.src = nextUrl;
-    const stats = JSON.parse(response.headers.get('X-Render-Stats') || '{}');
-    const fps = stats.render_ms ? Math.round(1000 / stats.render_ms) : '—';
-    els.fpsValue.textContent = fps;
-    els.serverMetrics.textContent = `${stats.width}×${stats.height} · ${stats.render_ms || '—'} ms · ${stats.peak_allocated_mib || '—'} MiB`;
+    updateStreamMetrics(JSON.parse(response.headers.get('X-Render-Stats') || '{}'));
   } catch (error) {
     showToast(`服务端渲染失败：${readableError(error)}`, true);
   } finally {
@@ -301,12 +424,19 @@ async function disposeViewer() {
   }
 }
 
-async function loadScene(source, metadata, format, skipDispose = false) {
+async function loadScene(source, metadata, extension, skipDispose = false) {
   if (!hasWebGL2()) return showToast('当前浏览器不支持 WebGL 2', true);
   showLoading(metadata.demo ? '正在打开示例场景' : '正在读取模型');
   els.openFileTop.disabled = true;
 
   try {
+    await loadClientRenderer();
+    const format = {
+      ply: GaussianSplats3D.SceneFormat.Ply,
+      splat: GaussianSplats3D.SceneFormat.Splat,
+      ksplat: GaussianSplats3D.SceneFormat.KSplat,
+      spz: GaussianSplats3D.SceneFormat.Spz
+    }[extension];
     if (!skipDispose) await disposeViewer();
     viewer = createViewer();
     activeFile = metadata;
@@ -359,11 +489,11 @@ async function handleFile(file) {
     return;
   }
   const extension = getExtension(file.name);
-  if (!formats[extension]) return showToast('仅支持 .ply、.splat、.ksplat 和 .spz 文件', true);
+  if (!clientFormats.has(extension)) return showToast('仅支持 .ply、.splat、.ksplat 和 .spz 文件', true);
   if (file.size === 0) return showToast('文件为空，无法加载', true);
   await disposeViewer();
   objectUrl = URL.createObjectURL(file);
-  await loadScene(objectUrl, { name: file.name, size: file.size, extension }, formats[extension], true);
+  await loadScene(objectUrl, { name: file.name, size: file.size, extension }, extension, true);
 }
 
 async function loadDemo() {
@@ -374,7 +504,7 @@ async function loadDemo() {
   }
   const response = await fetch('./demo.splat', { method: 'HEAD' });
   const size = Number(response.headers.get('content-length')) || 0;
-  await loadScene('./demo.splat', { name: 'Luma_Orbit.splat', size, extension: 'splat', demo: true }, formats.splat);
+  await loadScene('./demo.splat', { name: 'Luma_Orbit.splat', size, extension: 'splat', demo: true }, 'splat');
 }
 
 function resetView() {
@@ -383,7 +513,7 @@ function resetView() {
     serverCamera.yaw = serverStatus.camera?.yaw || 0;
     serverCamera.pitch = serverStatus.camera?.pitch || 0;
     serverCamera.distance = serverStatus.camera?.distance || serverStatus.radius * 2.6;
-    requestServerRender();
+    scheduleServerRender(false);
     showToast('服务端视角已重置');
     return;
   }
@@ -395,14 +525,26 @@ function resetView() {
   showToast('视角已重置');
 }
 
-function saveScreenshot() {
+async function saveScreenshot() {
   if (renderLocation === 'server') {
-    if (!serverFrameUrl) return;
-    const link = document.createElement('a');
-    link.download = `${(activeFile?.name || '3dgs').replace(/\.[^.]+$/, '')}-server-view.jpg`;
-    link.href = serverFrameUrl;
-    link.click();
-    showToast('服务端渲染截图已保存');
+    if (!serverStatus) return;
+    try {
+      const response = await fetch(`${API_BASE}/api/render`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...serverRenderPayload(false), lod: 'full', jpeg_quality: 94 })
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.download = `${(activeFile?.name || '3dgs').replace(/\.[^.]+$/, '')}-server-view.jpg`;
+      link.href = url;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      showToast('服务端高清截图已保存');
+    } catch (error) {
+      showToast(`截图失败：${readableError(error)}`, true);
+    }
     return;
   }
   if (!viewer) return;
@@ -440,15 +582,15 @@ els.serverMode.addEventListener('click', () => switchMode('server'));
 els.togglePanel.addEventListener('click', () => setPanel(!els.modelPanel.classList.contains('visible')));
 els.closePanel.addEventListener('click', () => setPanel(false));
 els.resetView.addEventListener('click', resetView);
-els.screenshot.addEventListener('click', saveScreenshot);
+els.screenshot.addEventListener('click', () => saveScreenshot());
 els.fullscreen.addEventListener('click', () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen());
 els.backgroundSelect.addEventListener('change', () => {
-  if (renderLocation === 'server') requestServerRender();
+  if (renderLocation === 'server') scheduleServerRender(false);
   else if (viewer) viewer.renderer.setClearColor(els.backgroundSelect.value, 1);
 });
 els.qualitySelect.addEventListener('change', () => {
   if (renderLocation === 'server') {
-    requestServerRender();
+    scheduleServerRender(false);
     showToast(els.qualitySelect.value === 'performance' ? '服务端性能模式' : '服务端高清模式');
     return;
   }
@@ -480,18 +622,24 @@ els.serverViewport.addEventListener('pointermove', (event) => {
   serverDrag = { x: event.clientX, y: event.clientY };
   serverCamera.yaw -= dx * 0.008;
   serverCamera.pitch = Math.max(-1.48, Math.min(1.48, serverCamera.pitch + dy * 0.008));
-  requestServerRender();
+  scheduleServerRender(true);
 });
-els.serverViewport.addEventListener('pointerup', () => { serverDrag = null; });
-els.serverViewport.addEventListener('pointercancel', () => { serverDrag = null; });
+els.serverViewport.addEventListener('pointerup', () => { serverDrag = null; scheduleServerRender(false); });
+els.serverViewport.addEventListener('pointercancel', () => { serverDrag = null; scheduleServerRender(false); });
 els.serverViewport.addEventListener('wheel', (event) => {
   if (renderLocation !== 'server' || !serverStatus) return;
   event.preventDefault();
   const min = serverStatus.radius * 0.08;
   const max = serverStatus.radius * 20;
   serverCamera.distance = Math.max(min, Math.min(max, serverCamera.distance * Math.exp(event.deltaY * 0.001)));
-  requestServerRender();
+  scheduleServerRender(true);
 }, { passive: false });
+
+window.addEventListener('pagehide', () => {
+  if (serverSession) {
+    fetch(`${API_BASE}/api/session/${serverSession}`, { method: 'DELETE', keepalive: true }).catch(() => {});
+  }
+});
 
 updateCapabilityBadge();
 updateModeUi();

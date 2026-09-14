@@ -1,11 +1,11 @@
-const { chromium } = require('playwright');
+const { chromium } = require('playwright-core');
 const path = require('node:path');
 
 (async () => {
   const baseUrl = process.env.VIEWER_URL || 'http://127.0.0.1:4173';
   const browser = await chromium.launch({
     headless: true,
-    executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    executablePath: process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
     args: ['--enable-webgl', '--use-angle=swiftshader', '--ignore-gpu-blocklist']
   });
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });

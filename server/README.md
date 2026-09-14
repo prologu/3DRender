@@ -38,6 +38,11 @@ MODEL_PATH=/workspace/luma-server-render/models/model.ply \
 - `GET /api/status`：GPU、运行环境和当前模型状态
 - `POST /api/render`：按 yaw、pitch、distance、FOV 和分辨率渲染
 - `POST /api/model`：以请求体上传 binary little-endian 标准 3DGS PLY
+- `POST /api/session`：创建只保留最新相机状态的交互会话
+- `GET /api/session/{id}/stream`：接收 MJPEG 长连接帧流
+- `POST /api/session/{id}/camera`：切换 preview / balanced / full LOD 并更新视角
+
+默认 LOD 是 25% / 55% / 100% 的稳定嵌套集合。`MAX_SESSIONS` 默认 4，`SESSION_TTL` 默认 120 秒；空闲会话不持续占用 GPU。
 
 Docker 未发布端口时，在访问设备建立转发：
 

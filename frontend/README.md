@@ -1,6 +1,6 @@
 # Luma Splat · 3DGS Viewer
 
-一个轻量、隐私优先的浏览器端 3D Gaussian Splatting 查看器。模型仅在浏览器内读取和渲染，不会上传到服务器。
+一个轻量的 Web 3D Gaussian Splatting 查看器，提供浏览器本地渲染和 GPU 服务端渲染两种模式。本地模式的模型不会离开浏览器；只有主动切换到服务端模式后才会上传 PLY。
 
 ## 功能
 
@@ -10,7 +10,9 @@
 - 模型大小、高斯点数和实时帧率信息
 - 背景主题、高清/性能模式和 PNG 截图
 - 内置离线 `.splat` 示例
-- 静态部署，不需要后端和 GPU
+- 本地模式可静态部署，不需要后端和 GPU
+- 服务端模式支持 MJPEG 长连接、最新相机状态合并和交互式自适应 LOD
+- 本地 WebGL 渲染包按需加载，服务端模式首屏更轻
 
 ## 本地运行
 
@@ -24,6 +26,16 @@ npm run dev
 
 ```bash
 npm run build
+```
+
+浏览器回归测试使用本机 Chrome；其他平台通过 `CHROME_PATH` 指定可执行文件：
+
+```bash
+npm run test:client
+VIEWER_URL=http://127.0.0.1:4173 \
+RENDER_API=http://127.0.0.1:18090 \
+EXPECTED_MODEL=model.ply \
+npm run test:server
 ```
 
 ## 浏览器要求
@@ -52,7 +64,7 @@ ssh -N -L 18088:127.0.0.1:8088 V100-tailscale-ljq
 
 ## 服务端渲染模式
 
-页面右上角可切换“本地渲染 / 服务端渲染”。服务端模式将标准 3DGS PLY 上传到 gsplat API，由 V100 渲染 JPEG 帧；浏览器通过拖动、滚轮、背景和画质控件更新相机请求。
+页面右上角可切换“本地渲染 / 服务端渲染”。服务端模式将标准 3DGS PLY 上传到 gsplat API，由 V100 渲染 JPEG 帧；浏览器通过拖动、滚轮、背景和画质控件更新相机。拖动期间使用 preview LOD，停止后自动细化，连续状态通过一个 MJPEG 流返回。
 
 本地测试默认端口：
 

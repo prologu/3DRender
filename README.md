@@ -8,6 +8,9 @@
 - 服务端 GPU 渲染：标准 binary little-endian 3DGS `.ply`
 - 文件选择与拖放上传、轨道旋转、滚轮缩放、背景切换、画质切换、截图和全屏
 - 服务端采用 PyTorch + CUDA + gsplat，模型常驻显存
+- 服务端 MJPEG 长连接帧流；相机更新采用“最新状态优先”，避免旧帧排队
+- 交互时自动使用 640×360 preview LOD，停止操作后恢复平衡或完整 LOD
+- 浏览器渲染核心按需加载，纯服务端用户无需先下载大型 WebGL 渲染包
 - 隔离式依赖安装，不修改系统 Python/CUDA；PyPI 默认使用国内镜像
 - 提供错误导出 PLY 的修复工具和 GPU 显存基准工具
 
@@ -57,7 +60,7 @@ PHYSICAL_GPU=3 MODEL_PATH=/absolute/path/model.ply ./run-render-server.sh
 | `MIN_FREE_MIB` | `1750` | 发起渲染前要求的最低空闲显存 |
 | `MODEL_PATH` | 空 | 启动时预加载的标准 3DGS PLY |
 
-API 包括 `GET /health`、`GET /api/status`、`POST /api/model` 和 `POST /api/render`。当前测试容器未发布端口时，可在访问设备上建立 SSH 转发：
+API 包括 `GET /health`、`GET /api/status`、`POST /api/model`、`POST /api/render`，以及 `/api/session` 下的交互帧流接口。当前测试容器未发布端口时，可在访问设备上建立 SSH 转发：
 
 ```bash
 ssh -N \
@@ -78,9 +81,21 @@ python server/fix_standard_3dgs_ply.py input.ply input_fixed.ply
 
 脚本执行 `scale_* = log(scale)` 和 `opacity = logit(opacity)`，并拒绝覆盖输入文件。
 
+## 性能验证
+
+在 Tesla V100-SXM2-32GB、修复后的 1,160,393 Gaussian 场景上，热身后的单会话结果如下。数据用于回归参考，不代表所有场景；屏幕覆盖面积较大的 Gaussian 会显著增加光栅化成本。
+
+| LOD | Gaussian 数 | 分辨率 | 总耗时 | 峰值分配显存 |
+| --- | ---: | ---: | ---: | ---: |
+| preview | 290,098 | 640×360 | 约 9.1 ms | 约 101.5 MiB |
+| balanced | 638,216 | 800×450 | 约 11.6 ms | 约 147.7 MiB |
+| full | 1,160,393 | 1280×720 | 约 14.8 ms | 约 216.9 MiB |
+
+首次调用还包含 CUDA/gsplat 内核热身，不应计入稳定帧时延。
+
 ## 当前边界与路线
 
-当前服务端传输完整 JPEG 帧，适合验证功能和显存边界；单进程通过锁串行访问一张 GPU。后续将围绕空间分块、视锥裁剪、屏幕误差 LOD、渐进式加载、帧请求合并、编码管线以及多会话调度继续演进，使千万到亿级 Gaussian 场景不必一次性常驻单卡显存。
+当前已经具备帧流、请求合并和稳定嵌套 LOD，但完整模型仍一次性常驻单卡显存，因此这版属于“流畅交互层”，还不是最终的亿级 Gaussian out-of-core 渲染器。下一阶段需要空间层次预处理、视锥/遮挡选择、CPU mmap 与 GPU tile cache，才能让场景规模脱离单卡容量限制。详见 [技术架构](docs/ARCHITECTURE.md) 与 [大场景路线](docs/LARGE_SCENES.md)。
 
 ## License
 

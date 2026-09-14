@@ -159,6 +159,7 @@ class RendererState:
         self.lock = threading.RLock()
         self.model: dict[str, torch.Tensor] | None = None
         self.metadata: dict | None = None
+        self.model_generation = 0
 
     def status(self) -> dict:
         return {
@@ -171,6 +172,12 @@ class RendererState:
             "memory_fraction": self.memory_fraction,
             "gpu": gpu_snapshot(self.physical_gpu),
             "model": self.metadata,
+            "model_generation": self.model_generation,
+            "capabilities": {
+                "adaptive_lod": True,
+                "mjpeg_stream": True,
+                "latest_camera_wins": True,
+            },
         }
 
     def load(self, path: Path) -> dict:
@@ -178,6 +185,18 @@ class RendererState:
         if snapshot["free_mib"] < self.min_free_mib:
             raise RuntimeError(f"GPU 剩余显存不足：{snapshot['free_mib']} MiB")
         arrays, metadata = cpu_arrays_from_ply(path)
+        # Sort once by a view-independent projected-area proxy. Every LOD is then
+        # a stable prefix of the same tensors, so quality changes never reshuffle
+        # Gaussians and do not allocate index buffers for every frame.
+        importance = arrays["opacities"] * np.square(np.max(arrays["scales"], axis=1))
+        order = np.argsort(importance, kind="stable")[::-1]
+        arrays = {name: np.ascontiguousarray(values[order]) for name, values in arrays.items()}
+        count = metadata["gaussians"]
+        metadata["lod_levels"] = {
+            "preview": min(count, max(1_000, int(count * 0.25))),
+            "balanced": min(count, max(1_000, int(count * 0.55))),
+            "full": count,
+        }
         with self.lock:
             self.model = None
             gc.collect()
@@ -188,7 +207,22 @@ class RendererState:
             }
             self.model = model
             self.metadata = metadata
+            self.model_generation += 1
         return metadata
+
+    def lod_count(self, request: dict) -> tuple[int, str]:
+        if self.metadata is None:
+            raise RuntimeError("尚未加载模型")
+        levels = self.metadata["lod_levels"]
+        requested = request.get("lod", "full")
+        if isinstance(requested, (int, float)):
+            fraction = float(np.clip(float(requested), 0.05, 1.0))
+            count = min(levels["full"], max(1_000, int(levels["full"] * fraction)))
+            return count, f"{fraction:.2f}"
+        name = str(requested).lower()
+        if name not in levels:
+            name = "full"
+        return levels[name], name
 
     @staticmethod
     def view_matrix(center: np.ndarray, yaw: float, pitch: float, distance: float) -> np.ndarray:
@@ -236,6 +270,8 @@ class RendererState:
             dtype=np.float32,
         )
 
+        gaussian_count, lod_name = self.lod_count(request)
+        jpeg_quality = int(np.clip(int(request.get("jpeg_quality", 88)), 55, 95))
         started = time.perf_counter()
         with self.lock, torch.inference_mode():
             free_bytes, _ = torch.cuda.mem_get_info(self.device)
@@ -244,12 +280,13 @@ class RendererState:
                 raise RuntimeError(f"GPU 剩余显存不足：{free_mib} MiB")
             torch.cuda.reset_peak_memory_stats(self.device)
             try:
+                gpu_started = time.perf_counter()
                 rendered, _, _ = rasterization(
-                    means=self.model["means"],
-                    quats=self.model["quats"],
-                    scales=self.model["scales"],
-                    opacities=self.model["opacities"],
-                    colors=self.model["colors"],
+                    means=self.model["means"][:gaussian_count],
+                    quats=self.model["quats"][:gaussian_count],
+                    scales=self.model["scales"][:gaussian_count],
+                    opacities=self.model["opacities"][:gaussian_count],
+                    colors=self.model["colors"][:gaussian_count],
                     viewmats=torch.from_numpy(view).to(self.device)[None],
                     Ks=torch.from_numpy(intrinsics).to(self.device)[None],
                     width=width,
@@ -261,19 +298,29 @@ class RendererState:
                     rasterize_mode="classic",
                 )
                 torch.cuda.synchronize(self.device)
+                gpu_ms = (time.perf_counter() - gpu_started) * 1000.0
                 pixels = rendered[0].clamp(0, 1).mul(255).byte().cpu().numpy()
             except torch.cuda.OutOfMemoryError as exc:
                 torch.cuda.empty_cache()
                 raise RuntimeError("服务端渲染达到显存保护上限") from exc
 
         from io import BytesIO
+        encode_started = time.perf_counter()
         buffer = BytesIO()
-        Image.fromarray(pixels, "RGB").save(buffer, format="JPEG", quality=88, optimize=False)
+        Image.fromarray(pixels, "RGB").save(
+            buffer, format="JPEG", quality=jpeg_quality, optimize=False
+        )
+        encode_ms = (time.perf_counter() - encode_started) * 1000.0
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         stats = {
             "render_ms": round(elapsed_ms, 2),
+            "gpu_ms": round(gpu_ms, 2),
+            "encode_ms": round(encode_ms, 2),
             "width": width,
             "height": height,
+            "gaussians": gaussian_count,
+            "lod": lod_name,
+            "jpeg_bytes": buffer.tell(),
             "peak_allocated_mib": round(torch.cuda.max_memory_allocated(self.device) / 2**20, 1),
             "peak_reserved_mib": round(torch.cuda.max_memory_reserved(self.device) / 2**20, 1),
             "yaw": yaw, "pitch": pitch, "distance": distance,
@@ -281,8 +328,120 @@ class RendererState:
         return buffer.getvalue(), stats
 
 
+class RenderSession:
+    """A single MJPEG consumer with a coalescing latest-camera mailbox."""
+
+    def __init__(self, session_id: str, initial_request: dict):
+        self.id = session_id
+        self.condition = threading.Condition()
+        self.request = dict(initial_request)
+        self.revision = 1
+        self.closed = False
+        self.stream_attached = False
+        self.last_seen = time.monotonic()
+        self.stats: dict | None = None
+
+    def update(self, request: dict) -> int:
+        with self.condition:
+            self.request.update(request)
+            self.revision += 1
+            self.last_seen = time.monotonic()
+            self.condition.notify_all()
+            return self.revision
+
+    def next_request(self, rendered_revision: int, timeout: float = 15.0):
+        with self.condition:
+            self.condition.wait_for(
+                lambda: self.closed or self.revision > rendered_revision,
+                timeout=timeout,
+            )
+            self.last_seen = time.monotonic()
+            if self.closed:
+                return None
+            if self.revision <= rendered_revision:
+                return {}, rendered_revision
+            return dict(self.request), self.revision
+
+    def attach_stream(self) -> bool:
+        with self.condition:
+            if self.stream_attached or self.closed:
+                return False
+            self.stream_attached = True
+            self.last_seen = time.monotonic()
+            return True
+
+    def detach_stream(self) -> None:
+        with self.condition:
+            self.stream_attached = False
+            self.last_seen = time.monotonic()
+
+    def close(self) -> None:
+        with self.condition:
+            self.closed = True
+            self.condition.notify_all()
+
+
+class SessionRegistry:
+    def __init__(self, max_sessions: int, ttl_seconds: int):
+        self.max_sessions = max_sessions
+        self.ttl_seconds = ttl_seconds
+        self.lock = threading.RLock()
+        self.sessions: dict[str, RenderSession] = {}
+
+    def cleanup(self) -> None:
+        cutoff = time.monotonic() - self.ttl_seconds
+        with self.lock:
+            expired = [
+                session_id for session_id, session in self.sessions.items()
+                if session.last_seen < cutoff and not session.stream_attached
+            ]
+            for session_id in expired:
+                self.sessions.pop(session_id).close()
+
+    def create(self, initial_request: dict) -> RenderSession:
+        self.cleanup()
+        with self.lock:
+            if len(self.sessions) >= self.max_sessions:
+                raise RuntimeError("服务端交互会话已满，请稍后重试")
+            session = RenderSession(uuid.uuid4().hex, initial_request)
+            self.sessions[session.id] = session
+            return session
+
+    def get(self, session_id: str) -> RenderSession:
+        with self.lock:
+            session = self.sessions.get(session_id)
+        if session is None or session.closed:
+            raise ValueError("渲染会话不存在或已过期")
+        session.last_seen = time.monotonic()
+        return session
+
+    def delete(self, session_id: str) -> None:
+        with self.lock:
+            session = self.sessions.pop(session_id, None)
+        if session:
+            session.close()
+
+    def reset_for_model(self, metadata: dict) -> None:
+        camera = metadata.get("camera", {})
+        with self.lock:
+            sessions = list(self.sessions.values())
+        for session in sessions:
+            session.update({**camera, "lod": "full"})
+
+    def status(self) -> dict:
+        self.cleanup()
+        with self.lock:
+            active_streams = sum(session.stream_attached for session in self.sessions.values())
+            return {
+                "active": len(self.sessions),
+                "streams": active_streams,
+                "limit": self.max_sessions,
+                "ttl_seconds": self.ttl_seconds,
+            }
+
+
 class ApiHandler(BaseHTTPRequestHandler):
-    server_version = "LumaSplatServer/1.0"
+    server_version = "LumaSplatServer/1.1"
 
     @property
     def app(self):
@@ -293,7 +452,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Filename")
         self.send_header("Access-Control-Expose-Headers", "X-Render-Stats")
 
@@ -315,9 +474,30 @@ class ApiHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path in {"/health", "/api/status"}:
             try:
-                self.send_json(HTTPStatus.OK, self.app.state.status())
+                payload = self.app.state.status()
+                payload["sessions"] = self.app.sessions.status()
+                self.send_json(HTTPStatus.OK, payload)
             except Exception as exc:
                 self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"ok": False, "error": str(exc)})
+        elif path.startswith("/api/session/"):
+            try:
+                parts = path.strip("/").split("/")
+                if len(parts) == 4 and parts[3] == "stream":
+                    self.stream_session(parts[2])
+                elif len(parts) == 3:
+                    session = self.app.sessions.get(parts[2])
+                    self.send_json(HTTPStatus.OK, {
+                        "ok": True,
+                        "session": session.id,
+                        "revision": session.revision,
+                        "stats": session.stats,
+                    })
+                else:
+                    self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
+            except ValueError as exc:
+                self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
         else:
             self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
 
@@ -337,6 +517,23 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.send_header("X-Render-Stats", json.dumps(stats, separators=(",", ":")))
                 self.end_headers()
                 self.wfile.write(image)
+            elif path == "/api/session":
+                request = self.read_json_request()
+                session = self.app.sessions.create(request)
+                self.send_json(HTTPStatus.CREATED, {
+                    "ok": True,
+                    "session": session.id,
+                    "stream_url": f"/api/session/{session.id}/stream",
+                })
+            elif path.startswith("/api/session/") and path.endswith("/camera"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    raise ValueError("渲染会话路径无效")
+                session = self.app.sessions.get(parts[2])
+                revision = session.update(self.read_json_request())
+                self.send_json(HTTPStatus.ACCEPTED, {
+                    "ok": True, "session": session.id, "revision": revision
+                })
             elif path == "/api/model":
                 self.receive_model()
             else:
@@ -347,6 +544,69 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.INSUFFICIENT_STORAGE, {"ok": False, "error": str(exc)})
         except Exception as exc:
             self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+
+    def do_DELETE(self) -> None:
+        path = urlparse(self.path).path
+        parts = path.strip("/").split("/")
+        if len(parts) == 3 and parts[:2] == ["api", "session"]:
+            self.app.sessions.delete(parts[2])
+            self.send_json(HTTPStatus.OK, {"ok": True})
+        else:
+            self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
+
+    def read_json_request(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length < 0 or length > 64 * 1024:
+            raise ValueError("请求参数过大")
+        payload = json.loads(self.rfile.read(length) or b"{}")
+        if not isinstance(payload, dict):
+            raise ValueError("请求参数必须是 JSON object")
+        return payload
+
+    def stream_session(self, session_id: str) -> None:
+        session = self.app.sessions.get(session_id)
+        if not session.attach_stream():
+            self.send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "该会话已有帧流连接"})
+            return
+        self.send_response(HTTPStatus.OK)
+        self.cors()
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        rendered_revision = 0
+        last_image: bytes | None = None
+        last_stats: dict | None = None
+        try:
+            while not session.closed:
+                item = session.next_request(rendered_revision)
+                if item is None:
+                    break
+                request, revision = item
+                if revision > rendered_revision:
+                    last_image, last_stats = self.app.state.render(request)
+                    rendered_revision = revision
+                    session.stats = {**last_stats, "revision": revision}
+                if last_image is None:
+                    continue
+                stats_header = json.dumps(last_stats or {}, separators=(",", ":"))
+                headers = (
+                    "--frame\r\n"
+                    "Content-Type: image/jpeg\r\n"
+                    f"Content-Length: {len(last_image)}\r\n"
+                    f"X-Render-Stats: {stats_header}\r\n\r\n"
+                ).encode("ascii")
+                self.wfile.write(headers)
+                self.wfile.write(last_image)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            print(f"stream {session_id} stopped: {exc}", flush=True)
+        finally:
+            session.detach_stream()
 
     def receive_model(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -366,6 +626,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     stream.write(chunk)
                     remaining -= len(chunk)
             metadata = self.app.state.load(destination)
+            self.app.sessions.reset_for_model(metadata)
         except Exception:
             destination.unlink(missing_ok=True)
             raise
@@ -375,11 +636,15 @@ class ApiHandler(BaseHTTPRequestHandler):
 class RenderServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, state: RendererState, upload_dir: Path, max_upload_bytes: int):
+    def __init__(
+        self, address, state: RendererState, upload_dir: Path, max_upload_bytes: int,
+        max_sessions: int, session_ttl: int,
+    ):
         super().__init__(address, ApiHandler)
         self.state = state
         self.upload_dir = upload_dir
         self.max_upload_bytes = max_upload_bytes
+        self.sessions = SessionRegistry(max_sessions, session_ttl)
         self.app = self
 
 
@@ -391,6 +656,8 @@ def main() -> int:
     parser.add_argument("--memory-fraction", type=float, default=0.045)
     parser.add_argument("--min-free-mib", type=int, default=1750)
     parser.add_argument("--max-upload-gib", type=float, default=2.0)
+    parser.add_argument("--max-sessions", type=int, default=4)
+    parser.add_argument("--session-ttl", type=int, default=120)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--upload-dir", type=Path, default=Path("uploads"))
     args = parser.parse_args()
@@ -401,7 +668,8 @@ def main() -> int:
         metadata = state.load(args.model)
         print(f"Loaded {metadata['name']}: {metadata['gaussians']:,} Gaussians", flush=True)
     server = RenderServer(
-        (args.host, args.port), state, args.upload_dir.resolve(), int(args.max_upload_gib * 1024**3)
+        (args.host, args.port), state, args.upload_dir.resolve(),
+        int(args.max_upload_gib * 1024**3), max(1, args.max_sessions), max(30, args.session_ttl),
     )
     print(f"Server renderer listening on {args.host}:{args.port}", flush=True)
     server.serve_forever()
