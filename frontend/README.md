@@ -1,0 +1,69 @@
+# Luma Splat · 3DGS Viewer
+
+一个轻量、隐私优先的浏览器端 3D Gaussian Splatting 查看器。模型仅在浏览器内读取和渲染，不会上传到服务器。
+
+## 功能
+
+- 支持 `.ply`、`.splat`、`.ksplat`、`.spz`
+- 点击选择和全页面拖放导入
+- 轨道旋转、平移、缩放、重置视角和全屏
+- 模型大小、高斯点数和实时帧率信息
+- 背景主题、高清/性能模式和 PNG 截图
+- 内置离线 `.splat` 示例
+- 静态部署，不需要后端和 GPU
+
+## 本地运行
+
+```bash
+npm install --registry=https://registry.npmmirror.com
+node scripts/generate-demo.mjs
+npm run dev
+```
+
+构建生产版本：
+
+```bash
+npm run build
+```
+
+## 浏览器要求
+
+推荐使用最新版 Chrome、Edge 或 Firefox，需要 WebGL 2。超大 PLY 文件的内存占用可能达到文件大小的数倍，面向公网部署时建议后续增加 SOG/KSPLAT 转换与流式加载管线。
+
+## 当前测试部署
+
+- 容器目录：`/workspace/luma-splat-viewer`
+- 站点目录：`/workspace/luma-splat-viewer/site`
+- 容器内端口：`8088`
+- 进程号文件：`/workspace/luma-splat-viewer/server.pid`
+- 日志文件：`/workspace/luma-splat-viewer/server.log`
+
+当前 Docker 容器创建时没有向宿主机发布 `8088`，且不能在不重建容器的情况下补加端口映射。测试时使用 SSH 本地转发：
+
+```bash
+ssh -N -L 18088:127.0.0.1:8088 V100-tailscale-ljq
+```
+
+然后访问 `http://127.0.0.1:18088`。正式绑定域名时，可在宿主机反向代理到容器，或在维护窗口重建容器并增加 `-p 8088:8088`；这两种操作都不属于当前无中断部署范围。
+
+## 技术基础
+
+渲染核心采用 MIT 许可的 [GaussianSplats3D](https://github.com/mkkellogg/GaussianSplats3D)，界面与应用逻辑为本项目独立实现。
+
+## 服务端渲染模式
+
+页面右上角可切换“本地渲染 / 服务端渲染”。服务端模式将标准 3DGS PLY 上传到 gsplat API，由 V100 渲染 JPEG 帧；浏览器通过拖动、滚轮、背景和画质控件更新相机请求。
+
+本地测试默认端口：
+
+- 查看器：`http://127.0.0.1:18088`
+- 渲染 API：`http://127.0.0.1:18090`
+
+对应 SSH 转发：
+
+```bash
+ssh -N \
+  -L 18088:127.0.0.1:8088 \
+  -L 18090:127.0.0.1:8090 \
+  V100-tailscale-ljq
+```

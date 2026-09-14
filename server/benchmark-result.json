@@ -1,0 +1,98 @@
+{
+  "timestamp": "2026-09-10T10:23:44Z",
+  "physical_gpu": 3,
+  "visible_gpu": "Tesla V100-SXM2-32GB",
+  "torch": "2.0.1+cu118",
+  "cuda_runtime": "11.8",
+  "resolution": [
+    1280,
+    720
+  ],
+  "memory_fraction_cap": 0.045,
+  "allocator_cap_mib": 1462,
+  "initial_gpu": {
+    "used_mib": 28000,
+    "free_mib": 4495,
+    "total_mib": 32768,
+    "util_percent": 1
+  },
+  "results": [
+    {
+      "gaussians": 100000,
+      "median_ms": 1.28,
+      "fps": 780.46,
+      "peak_allocated_mib": 50.6,
+      "peak_reserved_mib": 74.0,
+      "gpu_after": {
+        "used_mib": 28132,
+        "free_mib": 4363,
+        "total_mib": 32768,
+        "util_percent": 0
+      },
+      "status": "ok"
+    },
+    {
+      "gaussians": 200000,
+      "median_ms": 1.94,
+      "fps": 516.28,
+      "peak_allocated_mib": 67.1,
+      "peak_reserved_mib": 102.0,
+      "gpu_after": {
+        "used_mib": 28160,
+        "free_mib": 4335,
+        "total_mib": 32768,
+        "util_percent": 3
+      },
+      "status": "ok"
+    },
+    {
+      "gaussians": 400000,
+      "median_ms": 2.42,
+      "fps": 413.63,
+      "peak_allocated_mib": 115.4,
+      "peak_reserved_mib": 136.0,
+      "gpu_after": {
+        "used_mib": 28194,
+        "free_mib": 4301,
+        "total_mib": 32768,
+        "util_percent": 5
+      },
+      "status": "ok"
+    },
+    {
+      "gaussians": 800000,
+      "median_ms": 3.19,
+      "fps": 313.02,
+      "peak_allocated_mib": 230.6,
+      "peak_reserved_mib": 250.0,
+      "gpu_after": {
+        "used_mib": 28308,
+        "free_mib": 4187,
+        "total_mib": 32768,
+        "util_percent": 6
+      },
+      "status": "ok"
+    },
+    {
+      "gaussians": 1200000,
+      "median_ms": 4.02,
+      "fps": 248.53,
+      "peak_allocated_mib": 360.7,
+      "peak_reserved_mib": 418.0,
+      "gpu_after": {
+        "used_mib": 28476,
+        "free_mib": 4019,
+        "total_mib": 32768,
+        "util_percent": 8
+      },
+      "status": "ok"
+    }
+  ],
+  "preview": "/workspace/luma-server-render/benchmark-result.png",
+  "final_gpu": {
+    "used_mib": 28476,
+    "free_mib": 4019,
+    "total_mib": 32768,
+    "util_percent": 0
+  }
+}

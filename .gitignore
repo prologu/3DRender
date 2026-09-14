@@ -1,0 +1,42 @@
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/tests/*.png
+frontend/tests/*.jpg
+
+# Server-local Python/CUDA environment and binary wheels
+server/python/
+server/.venv/
+server/wheels/
+
+# Models, uploads, generated frames, and runtime state
+server/models/
+server/uploads/
+server/*.log
+server/*.pid
+server/*.png
+server/*.jpg
+server/*.jpeg
+*.ply
+*.splat
+*.ksplat
+*.spz
+
+# Keep the small, intentional browser fixtures
+!frontend/public/demo.splat
+!frontend/tests/test-gaussian.ply
+!frontend/tests/test-gaussian.ksplat
+
+# Editors, operating systems, caches, and secrets
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.env.*
+!.env.example
+

@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""Minimal HTTP API for GPU-backed 3D Gaussian Splat rendering."""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import math
+import os
+import subprocess
+import threading
+import time
+import uuid
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+import numpy as np
+import torch
+from PIL import Image
+from gsplat import rasterization
+
+
+SH_C0 = 0.28209479177387814
+PLY_TYPES = {
+    "char": "i1", "int8": "i1", "uchar": "u1", "uint8": "u1",
+    "short": "<i2", "int16": "<i2", "ushort": "<u2", "uint16": "<u2",
+    "int": "<i4", "int32": "<i4", "uint": "<u4", "uint32": "<u4",
+    "float": "<f4", "float32": "<f4", "double": "<f8", "float64": "<f8",
+}
+
+
+def gpu_snapshot(physical_gpu: int) -> dict[str, int]:
+    output = subprocess.check_output(
+        [
+            "nvidia-smi", f"--id={physical_gpu}",
+            "--query-gpu=memory.used,memory.free,memory.total,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ], text=True,
+    ).strip()
+    used, free, total, util = (int(value.strip()) for value in output.split(","))
+    return {"used_mib": used, "free_mib": free, "total_mib": total, "util_percent": util}
+
+
+def parse_ply_header(path: Path) -> tuple[int, int, np.dtype]:
+    vertex_count: int | None = None
+    properties: list[tuple[str, str]] = []
+    in_vertices = False
+    little_endian = False
+    with path.open("rb") as stream:
+        if stream.readline().strip() != b"ply":
+            raise ValueError("文件不是 PLY 格式")
+        while True:
+            line = stream.readline()
+            if not line:
+                raise ValueError("PLY header 缺少 end_header")
+            text = line.decode("ascii", "strict").strip()
+            if text == "format binary_little_endian 1.0":
+                little_endian = True
+            elif text.startswith("format ") and text != "format binary_little_endian 1.0":
+                raise ValueError("服务端当前仅支持 binary_little_endian PLY")
+            elif text.startswith("element "):
+                parts = text.split()
+                in_vertices = len(parts) == 3 and parts[1] == "vertex"
+                if in_vertices:
+                    vertex_count = int(parts[2])
+            elif text.startswith("property ") and in_vertices:
+                parts = text.split()
+                if len(parts) != 3 or parts[1] not in PLY_TYPES:
+                    raise ValueError(f"不支持的 PLY 属性: {text}")
+                properties.append((parts[2], PLY_TYPES[parts[1]]))
+            elif text == "end_header":
+                if not little_endian or vertex_count is None:
+                    raise ValueError("PLY 格式或 vertex 数量无效")
+                return stream.tell(), vertex_count, np.dtype(properties)
+
+
+def cpu_arrays_from_ply(path: Path) -> tuple[dict[str, np.ndarray], dict]:
+    offset, count, dtype = parse_ply_header(path)
+    names = set(dtype.names or ())
+    required = {
+        "x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity",
+        "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+    }
+    missing = sorted(required.difference(names))
+    if missing:
+        raise ValueError(f"PLY 缺少标准 3DGS 属性: {', '.join(missing)}")
+    expected = offset + count * dtype.itemsize
+    if path.stat().st_size < expected:
+        raise ValueError("PLY 数据不完整")
+
+    vertices = np.memmap(path, dtype=dtype, mode="r", offset=offset, shape=(count,))
+    means = np.column_stack((vertices["x"], vertices["y"], vertices["z"])).astype(np.float32)
+    log_scales = np.column_stack(
+        (vertices["scale_0"], vertices["scale_1"], vertices["scale_2"])
+    ).astype(np.float32)
+    opacity_logits = np.asarray(vertices["opacity"], dtype=np.float32).copy()
+    quats = np.column_stack(
+        (vertices["rot_0"], vertices["rot_1"], vertices["rot_2"], vertices["rot_3"])
+    ).astype(np.float32)
+    dc = np.column_stack(
+        (vertices["f_dc_0"], vertices["f_dc_1"], vertices["f_dc_2"])
+    ).astype(np.float32)
+    del vertices
+
+    for label, values in {
+        "position": means, "scale": log_scales, "opacity": opacity_logits,
+        "rotation": quats, "color": dc,
+    }.items():
+        if not np.isfinite(values).all():
+            raise ValueError(f"{label} 包含 NaN 或 Inf")
+
+    scales = np.exp(np.clip(log_scales, -20.0, 8.0)).astype(np.float32)
+    opacities = (1.0 / (1.0 + np.exp(-np.clip(opacity_logits, -20.0, 20.0)))).astype(np.float32)
+    norms = np.linalg.norm(quats, axis=1, keepdims=True)
+    quats = quats / np.clip(norms, 1e-8, None)
+    colors = np.clip(0.5 + SH_C0 * dc, 0.0, 1.0).astype(np.float32)
+
+    bounds_min = means.min(axis=0)
+    bounds_max = means.max(axis=0)
+    center = (bounds_min + bounds_max) * 0.5
+    radius = max(float(np.linalg.norm(bounds_max - bounds_min) * 0.5), 1e-3)
+    median_scale = float(np.median(scales))
+    if median_scale > radius * 0.05:
+        raise ValueError(
+            "Gaussian 尺度异常：PLY 很可能把线性 scale 直接写进了标准 scale_* 字段；"
+            "请先执行 log(scale) 修复"
+        )
+
+    arrays = {
+        "means": means, "quats": quats, "scales": scales,
+        "opacities": opacities, "colors": colors,
+    }
+    metadata = {
+        "name": path.name,
+        "bytes": path.stat().st_size,
+        "gaussians": count,
+        "bounds_min": bounds_min.tolist(),
+        "bounds_max": bounds_max.tolist(),
+        "center": center.tolist(),
+        "radius": radius,
+        "median_scale": median_scale,
+        "camera": {"yaw": 0.0, "pitch": 0.0, "distance": radius * 2.6},
+    }
+    return arrays, metadata
+
+
+class RendererState:
+    def __init__(self, physical_gpu: int, memory_fraction: float, min_free_mib: int):
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA 不可用")
+        self.physical_gpu = physical_gpu
+        self.device = torch.device("cuda:0")
+        self.min_free_mib = min_free_mib
+        torch.cuda.set_per_process_memory_fraction(memory_fraction, self.device)
+        self.memory_fraction = memory_fraction
+        self.lock = threading.RLock()
+        self.model: dict[str, torch.Tensor] | None = None
+        self.metadata: dict | None = None
+
+    def status(self) -> dict:
+        return {
+            "ok": True,
+            "backend": "gsplat",
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "device": torch.cuda.get_device_name(self.device),
+            "physical_gpu": self.physical_gpu,
+            "memory_fraction": self.memory_fraction,
+            "gpu": gpu_snapshot(self.physical_gpu),
+            "model": self.metadata,
+        }
+
+    def load(self, path: Path) -> dict:
+        snapshot = gpu_snapshot(self.physical_gpu)
+        if snapshot["free_mib"] < self.min_free_mib:
+            raise RuntimeError(f"GPU 剩余显存不足：{snapshot['free_mib']} MiB")
+        arrays, metadata = cpu_arrays_from_ply(path)
+        with self.lock:
+            self.model = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            model = {
+                name: torch.from_numpy(values).to(self.device, non_blocking=False)
+                for name, values in arrays.items()
+            }
+            self.model = model
+            self.metadata = metadata
+        return metadata
+
+    @staticmethod
+    def view_matrix(center: np.ndarray, yaw: float, pitch: float, distance: float) -> np.ndarray:
+        pitch = float(np.clip(pitch, -1.48, 1.48))
+        offset = np.array([
+            math.sin(yaw) * math.cos(pitch),
+            math.sin(pitch),
+            -math.cos(yaw) * math.cos(pitch),
+        ], dtype=np.float32) * distance
+        eye = center + offset
+        forward = center - eye
+        forward /= max(float(np.linalg.norm(forward)), 1e-8)
+        up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        right = np.cross(up, forward)
+        if np.linalg.norm(right) < 1e-5:
+            up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            right = np.cross(up, forward)
+        right /= max(float(np.linalg.norm(right)), 1e-8)
+        true_up = np.cross(forward, right)
+        rotation = np.stack((right, -true_up, forward), axis=0)
+        view = np.eye(4, dtype=np.float32)
+        view[:3, :3] = rotation
+        view[:3, 3] = -rotation @ eye
+        return view
+
+    def render(self, request: dict) -> tuple[bytes, dict]:
+        if self.model is None or self.metadata is None:
+            raise RuntimeError("尚未加载模型")
+        width = int(np.clip(int(request.get("width", 960)), 320, 1920))
+        height = int(np.clip(int(request.get("height", 540)), 180, 1080))
+        yaw = float(request.get("yaw", 0.0))
+        pitch = float(request.get("pitch", 0.0))
+        distance = float(request.get("distance", self.metadata["camera"]["distance"]))
+        distance = float(np.clip(distance, self.metadata["radius"] * 0.08, self.metadata["radius"] * 20.0))
+        fov = float(np.clip(float(request.get("fov", 55.0)), 20.0, 100.0))
+        background = request.get("background", [9 / 255, 11 / 255, 15 / 255])
+        if not isinstance(background, list) or len(background) != 3:
+            background = [9 / 255, 11 / 255, 15 / 255]
+
+        center = np.asarray(self.metadata["center"], dtype=np.float32)
+        view = self.view_matrix(center, yaw, pitch, distance)
+        focal = 0.5 * height / math.tan(math.radians(fov) * 0.5)
+        intrinsics = np.array(
+            [[focal, 0.0, width * 0.5], [0.0, focal, height * 0.5], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+
+        started = time.perf_counter()
+        with self.lock, torch.inference_mode():
+            free_bytes, _ = torch.cuda.mem_get_info(self.device)
+            free_mib = int(free_bytes / 2**20)
+            if free_mib < self.min_free_mib:
+                raise RuntimeError(f"GPU 剩余显存不足：{free_mib} MiB")
+            torch.cuda.reset_peak_memory_stats(self.device)
+            try:
+                rendered, _, _ = rasterization(
+                    means=self.model["means"],
+                    quats=self.model["quats"],
+                    scales=self.model["scales"],
+                    opacities=self.model["opacities"],
+                    colors=self.model["colors"],
+                    viewmats=torch.from_numpy(view).to(self.device)[None],
+                    Ks=torch.from_numpy(intrinsics).to(self.device)[None],
+                    width=width,
+                    height=height,
+                    packed=True,
+                    # gsplat 1.5.3 packed mode expects a single [channels] background.
+                    backgrounds=torch.tensor(background, dtype=torch.float32, device=self.device),
+                    render_mode="RGB",
+                    rasterize_mode="classic",
+                )
+                torch.cuda.synchronize(self.device)
+                pixels = rendered[0].clamp(0, 1).mul(255).byte().cpu().numpy()
+            except torch.cuda.OutOfMemoryError as exc:
+                torch.cuda.empty_cache()
+                raise RuntimeError("服务端渲染达到显存保护上限") from exc
+
+        from io import BytesIO
+        buffer = BytesIO()
+        Image.fromarray(pixels, "RGB").save(buffer, format="JPEG", quality=88, optimize=False)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        stats = {
+            "render_ms": round(elapsed_ms, 2),
+            "width": width,
+            "height": height,
+            "peak_allocated_mib": round(torch.cuda.max_memory_allocated(self.device) / 2**20, 1),
+            "peak_reserved_mib": round(torch.cuda.max_memory_reserved(self.device) / 2**20, 1),
+            "yaw": yaw, "pitch": pitch, "distance": distance,
+        }
+        return buffer.getvalue(), stats
+
+
+class ApiHandler(BaseHTTPRequestHandler):
+    server_version = "LumaSplatServer/1.0"
+
+    @property
+    def app(self):
+        return self.server.app  # type: ignore[attr-defined]
+
+    def log_message(self, fmt: str, *args) -> None:
+        print(f"{self.address_string()} - {fmt % args}", flush=True)
+
+    def cors(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Filename")
+        self.send_header("Access-Control-Expose-Headers", "X-Render-Stats")
+
+    def send_json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.cors()
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.cors()
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        path = urlparse(self.path).path
+        if path in {"/health", "/api/status"}:
+            try:
+                self.send_json(HTTPStatus.OK, self.app.state.status())
+            except Exception as exc:
+                self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"ok": False, "error": str(exc)})
+        else:
+            self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
+
+    def do_POST(self) -> None:
+        path = urlparse(self.path).path
+        try:
+            if path == "/api/render":
+                length = int(self.headers.get("Content-Length", "0"))
+                if length > 64 * 1024:
+                    raise ValueError("渲染参数过大")
+                request = json.loads(self.rfile.read(length) or b"{}")
+                image, stats = self.app.state.render(request)
+                self.send_response(HTTPStatus.OK)
+                self.cors()
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(image)))
+                self.send_header("X-Render-Stats", json.dumps(stats, separators=(",", ":")))
+                self.end_headers()
+                self.wfile.write(image)
+            elif path == "/api/model":
+                self.receive_model()
+            else:
+                self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
+        except ValueError as exc:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+        except RuntimeError as exc:
+            self.send_json(HTTPStatus.INSUFFICIENT_STORAGE, {"ok": False, "error": str(exc)})
+        except Exception as exc:
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+
+    def receive_model(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0 or length > self.app.max_upload_bytes:
+            raise ValueError("模型为空或超过上传限制")
+        filename = Path(unquote(self.headers.get("X-Filename", "model.ply"))).name
+        if Path(filename).suffix.lower() != ".ply":
+            raise ValueError("服务端模式当前仅支持标准 3DGS PLY")
+        destination = self.app.upload_dir / f"{uuid.uuid4().hex}-{filename}"
+        remaining = length
+        try:
+            with destination.open("xb") as stream:
+                while remaining:
+                    chunk = self.rfile.read(min(4 * 1024 * 1024, remaining))
+                    if not chunk:
+                        raise ValueError("上传中断")
+                    stream.write(chunk)
+                    remaining -= len(chunk)
+            metadata = self.app.state.load(destination)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+        self.send_json(HTTPStatus.OK, {"ok": True, "model": metadata})
+
+
+class RenderServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address, state: RendererState, upload_dir: Path, max_upload_bytes: int):
+        super().__init__(address, ApiHandler)
+        self.state = state
+        self.upload_dir = upload_dir
+        self.max_upload_bytes = max_upload_bytes
+        self.app = self
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8090)
+    parser.add_argument("--physical-gpu", type=int, default=3)
+    parser.add_argument("--memory-fraction", type=float, default=0.045)
+    parser.add_argument("--min-free-mib", type=int, default=1750)
+    parser.add_argument("--max-upload-gib", type=float, default=2.0)
+    parser.add_argument("--model", type=Path)
+    parser.add_argument("--upload-dir", type=Path, default=Path("uploads"))
+    args = parser.parse_args()
+
+    args.upload_dir.mkdir(parents=True, exist_ok=True)
+    state = RendererState(args.physical_gpu, args.memory_fraction, args.min_free_mib)
+    if args.model:
+        metadata = state.load(args.model)
+        print(f"Loaded {metadata['name']}: {metadata['gaussians']:,} Gaussians", flush=True)
+    server = RenderServer(
+        (args.host, args.port), state, args.upload_dir.resolve(), int(args.max_upload_gib * 1024**3)
+    )
+    print(f"Server renderer listening on {args.host}:{args.port}", flush=True)
+    server.serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
