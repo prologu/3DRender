@@ -379,7 +379,9 @@ class RendererState:
         return 1.0
 
     @staticmethod
-    def view_matrix(center: np.ndarray, yaw: float, pitch: float, distance: float) -> np.ndarray:
+    def view_matrix(center: np.ndarray, yaw: float, pitch: float, distance: float,
+                    pan=(0.0, 0.0, 0.0)) -> np.ndarray:
+        center = center + np.asarray(pan, dtype=np.float32).reshape(3)
         pitch = float(pitch)
         offset = np.array([
             math.sin(yaw) * math.cos(pitch),
@@ -418,7 +420,15 @@ class RendererState:
             background = [9 / 255, 11 / 255, 15 / 255]
 
         center = np.asarray(self.metadata["center"], dtype=np.float32)
-        view = self.view_matrix(center, yaw, pitch, distance)
+        try:
+            pan = np.asarray(request.get("pan", [0.0, 0.0, 0.0]), dtype=np.float32).reshape(3)
+        except (ValueError, TypeError):
+            pan = np.zeros(3, dtype=np.float32)
+        pan_norm = float(np.linalg.norm(pan))
+        pan_max = self.metadata["radius"] * 8.0
+        if pan_norm > pan_max:
+            pan = pan * (pan_max / pan_norm)
+        view = self.view_matrix(center, yaw, pitch, distance, pan)
         focal = 0.5 * height / math.tan(math.radians(fov) * 0.5)
         intrinsics = np.array(
             [[focal, 0.0, width * 0.5], [0.0, focal, height * 0.5], [0.0, 0.0, 1.0]],

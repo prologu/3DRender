@@ -15,7 +15,8 @@ const els = {
   clientMode: $('#clientMode'), serverMode: $('#serverMode'), serverViewport: $('#serverViewport'),
   serverFrame: $('#serverFrame'), serverMetrics: $('#serverMetrics'), welcomeDescription: $('#welcomeDescription'),
   dropTitle: $('#dropTitle'), dropSubtitle: $('#dropSubtitle'), backendLabel: $('#backendLabel'),
-  renderModeLabel: $('#renderModeLabel'), privacyTitle: $('#privacyTitle'), privacyText: $('#privacyText')
+  renderModeLabel: $('#renderModeLabel'), privacyTitle: $('#privacyTitle'), privacyText: $('#privacyText'),
+  lodSlider: $('#lodSlider'), lodValue: $('#lodValue'), navPad: $('#navPad')
 };
 
 const clientFormats = new Set(['ply', 'splat', 'ksplat', 'spz']);
@@ -52,7 +53,12 @@ let hybridPreviewGen = null;
 // 叠加层只渲染 25% 稀疏点，反而产生空洞与“点被移除/团块”观感。需要即时反馈时置 true。
 const USE_HYBRID_PREVIEW = false;
 let serverDevice = null;
-const serverCamera = { yaw: 0, pitch: 0, distance: 6 };
+const serverCamera = { yaw: 0, pitch: 0, distance: 6, pan: [0, 0, 0] };
+// 视口相对旋转灵敏度：拖动整个视口高度约转 120°（可控，避免“轻微拖动大量旋转”）。
+function rotationSpeed() {
+  const h = Math.max(300, els.serverViewport.clientHeight || 720);
+  return (120 * Math.PI / 180) / h;
+}
 function deviceLabel() {
   const name = (serverDevice || '').replace(/^NVIDIA\s+/i, '').trim();
   return name || 'GPU';
@@ -93,22 +99,26 @@ function backgroundRgb() {
   return [0, 2, 4].map((offset) => parseInt(hex.slice(offset, offset + 2), 16) / 255);
 }
 
-function serverResolution(interactive = false) {
-  if (interactive) return { width: 640, height: 360 };
+function serverResolution() {
   return els.qualitySelect.value === 'performance'
     ? { width: 800, height: 450 }
     : { width: 1280, height: 720 };
 }
 
+// LOD 滑杆（“置信度”）：选择加载的高斯比例 10%–100%，服务端自适应 LOD 仍会在超帧预算时自动降档。
+function lodFraction() {
+  return (els.lodSlider ? Number(els.lodSlider.value) : 100) / 100;
+}
+
 function serverRenderPayload(interactive = false) {
   const performanceMode = els.qualitySelect.value === 'performance';
   return {
-    ...serverCamera,
-    ...serverResolution(interactive),
+    ...serverCamera,           // 含 yaw/pitch/distance/pan
+    ...serverResolution(),     // 交互与静止同分辨率，避免拖动时低清发糊
     background: backgroundRgb(),
     fov: 55,
-    lod: performanceMode ? 'balanced' : 'full',
-    jpeg_quality: interactive ? 72 : (performanceMode ? 82 : 90)
+    lod: lodFraction(),
+    jpeg_quality: performanceMode ? 82 : 90
   };
 }
 
@@ -152,6 +162,7 @@ async function switchMode(mode) {
     els.modelPanel.classList.remove('visible');
     els.toolbar.classList.remove('visible');
     els.controlHint.classList.remove('visible');
+    els.navPad.classList.remove('visible');
     els.welcome.classList.remove('hidden');
     updateCapabilityBadge();
   }
@@ -162,6 +173,7 @@ function applyServerModel(model) {
   serverCamera.yaw = model.camera?.yaw || 0;
   serverCamera.pitch = model.camera?.pitch || 0;
   serverCamera.distance = model.camera?.distance || Math.max(model.radius * 2.6, 1);
+  serverCamera.pan = [0, 0, 0];
   activeFile = { name: model.name, size: model.bytes, extension: 'ply', server: true };
   els.fileName.textContent = model.name;
   els.fileType.textContent = 'PLY';
@@ -171,6 +183,7 @@ function applyServerModel(model) {
   els.modelPanel.classList.add('visible');
   els.toolbar.classList.add('visible');
   els.controlHint.classList.add('visible');
+  els.navPad.classList.add('visible');
   els.serverViewport.classList.add('ready');
   void loadHybridPreview();
 }
@@ -616,6 +629,8 @@ function resetView() {
     serverCamera.yaw = serverStatus.camera?.yaw || 0;
     serverCamera.pitch = serverStatus.camera?.pitch || 0;
     serverCamera.distance = serverStatus.camera?.distance || serverStatus.radius * 2.6;
+    serverCamera.pan = [0, 0, 0];
+    activePanDirs.clear(); recomputePanDir(); updatePanLoop();
     scheduleServerRender(false);
     showToast('服务端视角已重置');
     return;
@@ -724,8 +739,9 @@ els.serverViewport.addEventListener('pointermove', (event) => {
   const dx = event.clientX - serverDrag.x;
   const dy = event.clientY - serverDrag.y;
   serverDrag = { x: event.clientX, y: event.clientY };
-  serverCamera.yaw -= dx * 0.008;
-  serverCamera.pitch += dy * 0.008;
+  const rot = rotationSpeed();
+  serverCamera.yaw -= dx * rot;
+  serverCamera.pitch += dy * rot;
   syncHybridCamera();
   scheduleServerRender(true);
 });
@@ -740,6 +756,64 @@ els.serverViewport.addEventListener('wheel', (event) => {
   if (hybridViewer) { setHybridVisible(true); syncHybridCamera(); }
   scheduleServerRender(true);
 }, { passive: false });
+
+// ===== 前后左右移动（pan）：按住按钮/方向键沿相机本地方向平移，步长随缩放缩放 =====
+let panDir = null;            // { f: 前后系数, r: 左右系数 }
+let activePanDirs = new Set();
+let panRaf = null;
+const navDirVectors = { up: { f: 1, r: 0 }, down: { f: -1, r: 0 }, left: { f: 0, r: -1 }, right: { f: 0, r: 1 } };
+// 相机本地移动方向（世界系），与服务端 view_matrix 一致。
+function cameraMoveVectors() {
+  const { yaw, pitch } = serverCamera;
+  const forward = [-Math.sin(yaw) * Math.cos(pitch), -Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch)];
+  const right = [forward[2], 0, -forward[0]]; // cross(worldUp=(0,1,0), forward)
+  const n = Math.hypot(right[0], right[2]) || 1;
+  return { forward, right: [right[0] / n, 0, right[2] / n] };
+}
+function recomputePanDir() {
+  if (!activePanDirs.size) { panDir = null; return; }
+  let f = 0, r = 0;
+  for (const d of activePanDirs) { f += navDirVectors[d].f; r += navDirVectors[d].r; }
+  panDir = { f, r };
+}
+function updatePanLoop() {
+  if (panDir && !panRaf) panRaf = requestAnimationFrame(panTick);
+  if (!panDir && panRaf) { cancelAnimationFrame(panRaf); panRaf = null; scheduleServerRender(false); }
+}
+function panTick() {
+  panRaf = null;
+  if (!panDir || renderLocation !== 'server' || !serverStatus) return;
+  const { forward, right } = cameraMoveVectors();
+  const step = serverCamera.distance * 0.02;
+  for (let i = 0; i < 3; i++) serverCamera.pan[i] += (panDir.f * forward[i] + panDir.r * right[i]) * step;
+  scheduleServerRender(true);
+  if (panDir) panRaf = requestAnimationFrame(panTick);
+}
+function addPanDir(name) { if (navDirVectors[name] && renderLocation === 'server' && serverStatus) { activePanDirs.add(name); recomputePanDir(); updatePanLoop(); } }
+function removePanDir(name) { if (activePanDirs.has(name)) { activePanDirs.delete(name); recomputePanDir(); updatePanLoop(); } }
+// 导航盘按钮（按住持续移动）
+els.navPad?.querySelectorAll('.nav-btn').forEach((btn) => {
+  const dir = btn.dataset.dir;
+  const start = (event) => { event.preventDefault(); if (dir === 'stop') { activePanDirs.clear(); recomputePanDir(); updatePanLoop(); return; } addPanDir(dir); btn.classList.add('pressing'); };
+  const end = () => { btn.classList.remove('pressing'); removePanDir(dir); };
+  btn.addEventListener('pointerdown', start);
+  window.addEventListener('pointerup', end);
+  btn.addEventListener('pointercancel', end);
+});
+// 键盘：WASD / 方向键
+const keyToDir = { w: 'up', arrowup: 'up', s: 'down', arrowdown: 'down', a: 'left', arrowleft: 'left', d: 'right', arrowright: 'right' };
+window.addEventListener('keydown', (event) => {
+  if (/^(input|select|textarea)$/i.test(event.target.tagName || '')) return;
+  const dir = keyToDir[event.key.toLowerCase()];
+  if (dir) { event.preventDefault(); addPanDir(dir); }
+});
+window.addEventListener('keyup', (event) => { const dir = keyToDir[event.key.toLowerCase()]; if (dir) removePanDir(dir); });
+if (els.lodSlider) {
+  els.lodSlider.addEventListener('input', () => {
+    els.lodValue.textContent = els.lodSlider.value + '%';
+    if (renderLocation === 'server') scheduleServerRender(false);
+  });
+}
 
 window.addEventListener('pagehide', () => {
   if (serverSession) {
