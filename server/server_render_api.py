@@ -380,7 +380,7 @@ class RendererState:
 
     @staticmethod
     def view_matrix(center: np.ndarray, yaw: float, pitch: float, distance: float) -> np.ndarray:
-        pitch = float(np.clip(pitch, -1.48, 1.48))
+        pitch = float(pitch)
         offset = np.array([
             math.sin(yaw) * math.cos(pitch),
             math.sin(pitch),
@@ -887,7 +887,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     **last_stats, "revision": revision,
                     "lod_auto": round(session.auto_fraction, 3) if self.app.auto_lod else None,
                 }
-                stats_header = json.dumps(last_stats or {}, separators=(",", ":"))
+                stats_header = json.dumps(session.stats or {}, separators=(",", ":"))
                 headers = (
                     "--frame\r\n"
                     "Content-Type: image/jpeg\r\n"

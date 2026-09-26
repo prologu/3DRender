@@ -48,6 +48,9 @@ let streamFpsStartedAt = performance.now();
 let serverDrag = null;
 let hybridViewer = null;
 let hybridPreviewGen = null;
+// 本地粗模叠加层（拖动即时反馈）。默认关闭：服务端已可在帧预算内渲染全量点，
+// 叠加层只渲染 25% 稀疏点，反而产生空洞与“点被移除/团块”观感。需要即时反馈时置 true。
+const USE_HYBRID_PREVIEW = false;
 let serverDevice = null;
 const serverCamera = { yaw: 0, pitch: 0, distance: 6 };
 function deviceLabel() {
@@ -104,7 +107,7 @@ function serverRenderPayload(interactive = false) {
     ...serverResolution(interactive),
     background: backgroundRgb(),
     fov: 55,
-    lod: interactive ? 'preview' : (performanceMode ? 'balanced' : 'full'),
+    lod: performanceMode ? 'balanced' : 'full',
     jpeg_quality: interactive ? 72 : (performanceMode ? 82 : 90)
   };
 }
@@ -286,7 +289,7 @@ function hybridPreviewElement() {
 }
 
 async function loadHybridPreview() {
-  if (renderLocation !== 'server' || !serverStatus || hybridViewer) return;
+  if (!USE_HYBRID_PREVIEW || renderLocation !== 'server' || !serverStatus || hybridViewer) return;
   const generation = serverStatus.model_generation ?? `${serverStatus.name}:${serverStatus.bytes}`;
   if (hybridPreviewGen === generation) return;
   try {
@@ -722,7 +725,7 @@ els.serverViewport.addEventListener('pointermove', (event) => {
   const dy = event.clientY - serverDrag.y;
   serverDrag = { x: event.clientX, y: event.clientY };
   serverCamera.yaw -= dx * 0.008;
-  serverCamera.pitch = Math.max(-1.48, Math.min(1.48, serverCamera.pitch + dy * 0.008));
+  serverCamera.pitch += dy * 0.008;
   syncHybridCamera();
   scheduleServerRender(true);
 });
