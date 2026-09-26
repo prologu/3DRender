@@ -17,7 +17,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import numpy as np
 import torch
@@ -173,7 +173,14 @@ def cpu_arrays_from_ply(path: Path) -> tuple[dict[str, np.ndarray], dict]:
 
 
 class RendererState:
-    def __init__(self, physical_gpu: int, memory_fraction: float, min_free_mib: int):
+    def __init__(
+        self,
+        physical_gpu: int,
+        memory_fraction: float,
+        min_free_mib: int,
+        spatial_lod: bool = True,
+        stream_count: int = 4,
+    ):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA 不可用")
         self.physical_gpu = physical_gpu
@@ -181,10 +188,111 @@ class RendererState:
         self.min_free_mib = min_free_mib
         torch.cuda.set_per_process_memory_fraction(memory_fraction, self.device)
         self.memory_fraction = memory_fraction
+        # Model tensors are read-only during render; the lock now only guards
+        # model load/swap. Renders run concurrently on a small pool of CUDA
+        # streams so multiple sessions do not serialize on one lock.
         self.lock = threading.RLock()
+        self.streams = [torch.cuda.Stream(self.device) for _ in range(max(1, stream_count))]
+        self._stream_cond = threading.Condition()
+        self._stream_free = set(range(len(self.streams)))
+        self.spatial_lod = spatial_lod
+        self.spatial: dict | None = None
         self.model: dict[str, torch.Tensor] | None = None
         self.metadata: dict | None = None
         self.model_generation = 0
+
+    def _take_stream(self) -> int:
+        with self._stream_cond:
+            while not self._stream_free:
+                if not self._stream_cond.wait(timeout=30.0):
+                    raise RuntimeError("渲染流池耗尽：所有会话均在渲染中")
+            return self._stream_free.pop()
+
+    def _release_stream(self, index: int) -> None:
+        with self._stream_cond:
+            self._stream_free.add(index)
+            self._stream_cond.notify()
+
+    def _build_spatial(self, arrays: dict[str, np.ndarray], count: int) -> dict:
+        """Group Gaussians into dyadic-grid cells (a full octree for a point set)."""
+        means = arrays["means"]
+        target_cells = max(256, min(count // 512, 262_144))
+        g = 8
+        while g * g * g < target_cells and g < 64:
+            g *= 2
+        bb_min = means.min(axis=0)
+        bb_max = means.max(axis=0)
+        span = np.maximum(bb_max - bb_min, 1e-9)
+        cell = np.floor(np.clip((means - bb_min) / span, 0.0, 0.999999) * g).astype(np.int64)
+        cell_id = cell[:, 0] + cell[:, 1] * g + cell[:, 2] * g * g
+        order = np.argsort(cell_id, kind="stable")
+        sorted_ids = cell_id[order]
+        starts = np.concatenate(
+            ([0], np.flatnonzero(sorted_ids[1:] != sorted_ids[:-1]) + 1, [count])
+        )
+        rows = means[order]
+        bb_min_c = np.minimum.reduceat(rows, starts[:-1], axis=0)
+        bb_max_c = np.maximum.reduceat(rows, starts[:-1], axis=0)
+        diag = np.linalg.norm(bb_max_c - bb_min_c, axis=1)
+        return {
+            "g": g,
+            "cells": int(len(starts) - 1),
+            "order": order,
+            "starts": starts,
+            "counts": np.diff(starts),
+            "bb_min": bb_min_c,
+            "bb_max": bb_max_c,
+            "centroid": (bb_min_c + bb_max_c) * 0.5,
+            "diag": diag,
+        }
+
+    def _spatial_select(
+        self,
+        view: np.ndarray,
+        fov: float,
+        width: int,
+        height: int,
+        budget: int,
+    ) -> np.ndarray | None:
+        """Greedy screen-space-error leaf selection under a Gaussian count budget."""
+        spatial = self.spatial
+        if spatial is None:
+            return None
+        centroid = spatial["centroid"]
+        counts = spatial["counts"].astype(np.int64)
+        diag = spatial["diag"]
+        rotation = view[:3, :3]
+        eye = rotation.T @ (-view[:3, 3])
+        cam_to_c = centroid - eye
+        depth = cam_to_c @ rotation[2]
+        inside = depth > 1e-3
+        if not inside.any():
+            return None
+        right = cam_to_c @ rotation[0]
+        up = cam_to_c @ (-rotation[1])
+        half_w = math.tan(math.radians(fov) * 0.5)
+        half_h = half_w * height / width
+        margin = diag / np.maximum(depth, 1e-3) + 0.05
+        inside &= np.abs(right) / depth < half_w + margin
+        inside &= np.abs(up) / depth < half_h + margin
+        if not inside.any():
+            return None
+        focal = 0.5 * height / math.tan(math.radians(fov) * 0.5)
+        size_px = diag * focal / np.maximum(depth, 1e-3)
+        candidates = np.flatnonzero(inside)
+        ranked = candidates[np.argsort(-size_px[candidates], kind="stable")]
+        cum = np.cumsum(counts[ranked])
+        take = int(np.searchsorted(cum, budget, side="left")) + 1
+        take = max(1, min(take, len(ranked)))
+        chosen = ranked[:take]
+        per = counts[chosen]
+        total = int(per.sum())
+        base = spatial["starts"][chosen]
+        cum_sel = np.cumsum(per)
+        offsets = np.repeat(np.arange(take, dtype=np.int64), per)
+        return spatial["order"][
+            base[offsets] + (np.arange(total, dtype=np.int64) - np.repeat(cum_sel - per, per))
+        ]
 
     def status(self) -> dict:
         return {
@@ -202,6 +310,8 @@ class RendererState:
                 "adaptive_lod": True,
                 "mjpeg_stream": True,
                 "latest_camera_wins": True,
+                "spatial_lod": bool(self.spatial_lod and self.spatial is not None),
+                "stream_concurrency": len(self.streams),
             },
         }
 
@@ -222,6 +332,10 @@ class RendererState:
             "balanced": min(count, max(1_000, int(count * 0.55))),
             "full": count,
         }
+        if self.spatial_lod and count >= 10_000:
+            spatial = self._build_spatial(arrays, count)
+        else:
+            spatial = None
         with self.lock:
             self.model = None
             gc.collect()
@@ -232,6 +346,7 @@ class RendererState:
             }
             self.model = model
             self.metadata = metadata
+            self.spatial = spatial
             self.model_generation += 1
         return metadata
 
@@ -286,7 +401,8 @@ class RendererState:
         return view
 
     def render(self, request: dict) -> tuple[bytes, dict]:
-        if self.model is None or self.metadata is None:
+        model = self.model
+        if model is None or self.metadata is None:
             raise RuntimeError("尚未加载模型")
         width = int(np.clip(int(request.get("width", 960)), 320, 1920))
         height = int(np.clip(int(request.get("height", 540)), 180, 1080))
@@ -308,38 +424,61 @@ class RendererState:
         )
 
         gaussian_count, lod_name = self.lod_count(request)
+        full_count = self.metadata["lod_levels"]["full"]
+        lod_strategy = "prefix"
+        selection = None
+        spatial_ms = 0.0
+        if gaussian_count < full_count and self.spatial_lod and self.spatial is not None:
+            select_started = time.perf_counter()
+            selection = self._spatial_select(view, fov, width, height, gaussian_count)
+            spatial_ms = (time.perf_counter() - select_started) * 1000.0
+            if selection is not None:
+                lod_strategy = "spatial"
         jpeg_quality = int(np.clip(int(request.get("jpeg_quality", 88)), 55, 95))
         started = time.perf_counter()
-        with self.lock, torch.inference_mode():
+        stream_index = self._take_stream()
+        try:
             free_bytes, _ = torch.cuda.mem_get_info(self.device)
             free_mib = int(free_bytes / 2**20)
             if free_mib < self.min_free_mib:
                 raise RuntimeError(f"GPU 剩余显存不足：{free_mib} MiB")
             torch.cuda.reset_peak_memory_stats(self.device)
             try:
-                gpu_started = time.perf_counter()
-                rendered, _, _ = rasterization(
-                    means=self.model["means"][:gaussian_count],
-                    quats=self.model["quats"][:gaussian_count],
-                    scales=self.model["scales"][:gaussian_count],
-                    opacities=self.model["opacities"][:gaussian_count],
-                    colors=self.model["colors"][:gaussian_count],
-                    viewmats=torch.from_numpy(view).to(self.device)[None],
-                    Ks=torch.from_numpy(intrinsics).to(self.device)[None],
-                    width=width,
-                    height=height,
-                    packed=True,
-                    # gsplat 1.5.3 packed mode expects a single [channels] background.
-                    backgrounds=torch.tensor(background, dtype=torch.float32, device=self.device),
-                    render_mode="RGB",
-                    rasterize_mode="classic",
-                )
-                torch.cuda.synchronize(self.device)
-                gpu_ms = (time.perf_counter() - gpu_started) * 1000.0
-                pixels = rendered[0].clamp(0, 1).mul(255).byte().cpu().numpy()
+                with torch.cuda.stream(self.streams[stream_index]), torch.inference_mode():
+                    if selection is not None:
+                        index_tensor = torch.from_numpy(selection).to(self.device)
+                        params = {name: tensor[index_tensor] for name, tensor in model.items()}
+                    else:
+                        limit = gaussian_count if gaussian_count < full_count else None
+                        params = {
+                            name: (tensor[:limit] if limit is not None else tensor)
+                            for name, tensor in model.items()
+                        }
+                    gpu_started = time.perf_counter()
+                    rendered, _, _ = rasterization(
+                        means=params["means"],
+                        quats=params["quats"],
+                        scales=params["scales"],
+                        opacities=params["opacities"],
+                        colors=params["colors"],
+                        viewmats=torch.from_numpy(view).to(self.device)[None],
+                        Ks=torch.from_numpy(intrinsics).to(self.device)[None],
+                        width=width,
+                        height=height,
+                        packed=True,
+                        # gsplat 1.5.3 packed mode expects a single [channels] background.
+                        backgrounds=torch.tensor(background, dtype=torch.float32, device=self.device),
+                        render_mode="RGB",
+                        rasterize_mode="classic",
+                    )
+                    self.streams[stream_index].synchronize()
+                    gpu_ms = (time.perf_counter() - gpu_started) * 1000.0
+                    pixels = rendered[0].clamp(0, 1).mul(255).byte().cpu().numpy()
             except torch.cuda.OutOfMemoryError as exc:
                 torch.cuda.empty_cache()
                 raise RuntimeError("服务端渲染达到显存保护上限") from exc
+        finally:
+            self._release_stream(stream_index)
 
         encode_started = time.perf_counter()
         image_bytes = encode_jpeg(pixels, jpeg_quality)
@@ -351,8 +490,10 @@ class RendererState:
             "encode_ms": round(encode_ms, 2),
             "width": width,
             "height": height,
-            "gaussians": gaussian_count,
+            "gaussians": int(params["means"].shape[0]),
             "lod": lod_name,
+            "lod_strategy": lod_strategy,
+            "spatial_ms": round(spatial_ms, 2),
             "jpeg_bytes": len(image_bytes),
             "jpeg_backend": _JPEG_BACKEND,
             "peak_allocated_mib": round(torch.cuda.max_memory_allocated(self.device) / 2**20, 1),
@@ -360,6 +501,31 @@ class RendererState:
             "yaw": yaw, "pitch": pitch, "distance": distance,
         }
         return image_bytes, stats
+
+    def export_splat(self, count: int) -> bytes:
+        """Export importance-top-N Gaussians as a 32-byte-per-splat .splat preview."""
+        model = self.model
+        if model is None:
+            raise RuntimeError("尚未加载模型")
+        count = min(max(1, int(count)), model["means"].shape[0])
+        means = model["means"][:count].detach().cpu().numpy()
+        scales = model["scales"][:count].detach().cpu().numpy()
+        rgb = np.clip(model["colors"][:count].detach().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
+        opacity = np.clip(model["opacities"][:count].detach().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
+        dtype = np.dtype([
+            ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+            ("sx", "<f4"), ("sy", "<f4"), ("sz", "<f4"),
+            ("r", "u1"), ("g", "u1"), ("b", "u1"), ("o", "u1"),
+            ("pad", "u1", (4,)),
+        ])
+        buffer = np.empty(count, dtype=dtype)
+        buffer["x"], buffer["y"], buffer["z"] = means[:, 0], means[:, 1], means[:, 2]
+        buffer["sx"], buffer["sy"], buffer["sz"] = scales[:, 0], scales[:, 1], scales[:, 2]
+        buffer["r"], buffer["g"], buffer["b"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+        buffer["o"] = opacity
+        buffer["pad"][:] = (255, 128, 128, 128)
+        return buffer.tobytes()
+
 
 
 class RenderSession:
@@ -535,6 +701,24 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
             except Exception as exc:
                 self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+        elif path == "/api/model.splat":
+            try:
+                query = parse_qs(urlparse(self.path).query)
+                fraction = float(query.get("frac", ["0.25"])[0])
+                count, _ = self.app.state.lod_count({"lod": fraction})
+                data = self.app.state.export_splat(min(count, 2_000_000))
+                self.send_response(HTTPStatus.OK)
+                self.cors()
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "public, max-age=300")
+                self.end_headers()
+                self.wfile.write(data)
+            except ValueError:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Invalid frac"})
+            except Exception as exc:
+                self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"ok": False, "error": str(exc)})
+
         elif self.app.site_dir is not None:
             self.send_static(path, include_body=True)
         else:
@@ -717,7 +901,6 @@ class ApiHandler(BaseHTTPRequestHandler):
                     stream.write(chunk)
                     remaining -= len(chunk)
             metadata = self.app.state.load(destination)
-            self.app.sessions.reset_for_model(metadata)
         except Exception:
             destination.unlink(missing_ok=True)
             raise
@@ -762,10 +945,17 @@ def main() -> int:
                         help="禁用服务端自适应 LOD，严格使用客户端请求的档位")
     parser.add_argument("--frame-budget-ms", type=float, default=33.0,
                         help="自适应 LOD 的目标帧时间预算，毫秒（默认 33 ≈ 30fps）")
+    parser.add_argument("--spatial-lod", dest="spatial_lod", action="store_true", default=True,
+                        help="按空间八叉树选择 LOD 叶节点（默认开启）")
+    parser.add_argument("--no-spatial-lod", dest="spatial_lod", action="store_false",
+                        help="禁用空间 LOD，LOD 只按重要性前缀截取")
     args = parser.parse_args()
 
     args.upload_dir.mkdir(parents=True, exist_ok=True)
-    state = RendererState(args.physical_gpu, args.memory_fraction, args.min_free_mib)
+    state = RendererState(
+        args.physical_gpu, args.memory_fraction, args.min_free_mib,
+        spatial_lod=args.spatial_lod,
+    )
     if args.model:
         metadata = state.load(args.model)
         print(f"Loaded {metadata['name']}: {metadata['gaussians']:,} Gaussians", flush=True)

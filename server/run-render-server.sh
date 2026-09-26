@@ -33,6 +33,10 @@ fi
 if [[ "${AUTO_LOD:-true}" == "false" ]]; then
   args+=(--no-auto-lod)
 fi
+if [[ "${SPATIAL_LOD:-true}" == "false" ]]; then
+  args+=(--no-spatial-lod)
+fi
+
 
 
 # 解释器可覆盖：部署环境用 LUMA_PYTHON 指定（如 conda 环境路径），默认取 PATH 中的 python3。
