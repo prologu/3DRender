@@ -14,6 +14,10 @@ svg { width: 20px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-l
 #serverViewport.active.ready { opacity: 1; }
 #serverViewport:active { cursor: grabbing; }
 #serverFrame { width: 100%; height: 100%; object-fit: contain; display: block; pointer-events: none; }
+#serverPreview { position: absolute; inset: 0; z-index: 1; opacity: 0; pointer-events: none; transition: opacity .12s ease; }
+#serverPreview.visible { opacity: 1; }
+#serverPreview canvas { display: block; width: 100% !important; height: 100% !important; }
+
 .server-metrics { position: absolute; right: 22px; top: 95px; padding: 7px 10px; border: 1px solid rgba(255,255,255,.09); border-radius: 7px; background: rgba(12,15,16,.7); color: #85918b; font-size: 9px; backdrop-filter: blur(10px); }
 .ambient { position: absolute; inset: 0; pointer-events: none; background: radial-gradient(circle at 50% 45%, rgba(74, 106, 92, .16), transparent 30%), radial-gradient(circle at 12% 12%, rgba(66, 83, 74, .1), transparent 25%); }
 .glass { background: rgba(18, 21, 24, .74); border: 1px solid rgba(255,255,255,.1); box-shadow: 0 16px 45px rgba(0,0,0,.2); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); }

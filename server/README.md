@@ -58,9 +58,12 @@ bash ./run-render-server.sh
 - `POST /api/session`：创建只保留最新相机状态的交互会话
 - `GET /api/session/{id}/stream`：接收 MJPEG 长连接帧流
 - `POST /api/session/{id}/camera`：切换 preview / balanced / full LOD 并更新视角
+- `GET /api/model.splat?frac=0.25`：按重要性前缀导出 32 字节/点的 `.splat` 粗模（前端混合渲染用，单次下载后本地常驻）
 
 默认 LOD 是 25% / 55% / 100% 的稳定嵌套集合。`MAX_SESSIONS` 默认 4，`SESSION_TTL` 默认 120 秒；空闲会话不持续占用 GPU。
 服务端另有自适应帧预算（默认开启）：按每帧实际耗时（渲染+编码）对照 `FRAME_BUDGET_MS`（默认 33 ms ≈ 30fps）自动升降 LOD 比例，客户端请求的档位作为上限，有余量时逐步回升；`AUTO_LOD=false` 禁用。新会话前 3 帧跳过调整，避开显存分配与内核加载的瞬时尖峰。相机静止时 MJPEG 流不再重复传输旧帧。
+LOD 有两层选择策略：客户端档位决定每帧 Gaussian 预算，默认由空间 LOD 在预算内选点（加载时按二分网格分组，1.16M 点 → 4096 叶；每帧视锥裁剪 + 投影尺寸贪心，近处细节优先，纯 numpy 选择 <1.5 ms）；`SPATIAL_LOD=false` 回退为按重要性前缀截取，点数 <10K 时自动禁用。
+多个交互会话在独立 CUDA stream 上并发渲染（流池大小 = `MAX_SESSIONS`）：渲染路径不再持有全局锁，只有模型加载/更换时才互斥；各会话的 GPU 工作在同卡上重叠执行，无头程阻塞。A5000 实测（1.16M 点、balanced 档、相机 50ms 更新）：单会话 19.6 fps，双会话各 19.3 fps，四会话各 18.9 fps。
 
 Docker 未发布端口时，在访问设备建立转发：
 

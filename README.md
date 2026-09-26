@@ -7,7 +7,7 @@
 | 浏览器本地渲染 | 用户浏览器 / WebGL 2 | `.ply`、`.splat`、`.ksplat`、`.spz` | 快速查看、无需后端、文件不上传 |
 | GPU 服务端渲染 | Linux + NVIDIA GPU + gsplat | 标准 binary little-endian 3DGS `.ply` | 低配置客户端、大模型、统一算力 |
 
-服务端模式包含 MJPEG 长连接、相机状态合并（latest-camera-wins）以及 preview / balanced / full 自适应 LOD，并有服务端帧预算：每帧实际耗时超过 `FRAME_BUDGET_MS` 时在客户端请求档位内自动降低 LOD 比例保护帧率；相机静止时不再重复传输旧帧。当前 LOD 会减少每帧参与光栅化的 Gaussian 数量，但完整模型仍需常驻 GPU；城市级和亿级 Gaussian 的空间分块流式方案见 [大规模场景路线](docs/LARGE_SCENES.md)。
+服务端模式包含 MJPEG 长连接、相机状态合并（latest-camera-wins）以及三层 LOD：客户端档位（preview / balanced / full）控制总量、服务端帧预算按 `FRAME_BUDGET_MS` 自动升降比例、空间 LOD 按屏幕空间误差优先保留近处细节。多个交互会话在独立 CUDA stream 上并发渲染，互不串行；相机静止时不再重复传输旧帧。客户端混合渲染在拖动时用本地粗模（服务端导出的 25% `.splat`）即时预览，服务端高清帧到达即切换。完整模型仍需常驻 GPU；城市级和亿级 Gaussian 的空间分块流式方案见 [大规模场景路线](docs/LARGE_SCENES.md)。
 
 ## 目录
 
@@ -188,6 +188,7 @@ bash ./run-render-server.sh
 | `AUTO_LOD` | `true` | 启用服务端自适应 LOD；`false` 时严格使用客户端请求的档位 |
 | `LUMA_PYTHON` | `python3` | 启动使用的 Python 解释器（隔离部署指向 conda 环境路径） |
 | `LUMA_JPEG_BACKEND` | `pillow` | JPEG 编码后端，可设 `opencv`（需装 opencv-python-headless） |
+| `SPATIAL_LOD` | `true` | 启用空间 LOD（按视锥 + 屏幕空间误差选叶节点）；`false` 时 LOD 只按重要性前缀截取 |
 | `UPLOAD_DIR` | `server/uploads` | 上传文件保存目录 |
 
 显存比例不是模型容量保证。应根据模型 Gaussian 数、分辨率和同卡已有任务保守调整；脚本不会自动结束其他进程。
@@ -199,7 +200,7 @@ curl http://127.0.0.1:8090/health
 curl http://127.0.0.1:8090/api/status
 ```
 
-主要接口：`POST /api/model`、`POST /api/render`、`POST /api/session`、`POST /api/session/{id}/camera`、`GET /api/session/{id}/stream`。请求细节见 [技术架构](docs/ARCHITECTURE.md)。
+主要接口：`POST /api/model`、`POST /api/render`、`POST /api/session`、`POST /api/session/{id}/camera`、`GET /api/session/{id}/stream`、`GET /api/model.splat?frac=0.25`（导出粗模预览）。请求细节见 [技术架构](docs/ARCHITECTURE.md)。
 
 ### 性能优化（服务端帧流水线）
 
@@ -209,9 +210,11 @@ curl http://127.0.0.1:8090/api/status
 | --- | --- | --- |
 | 服务端自适应 LOD | 帧耗时超过 `FRAME_BUDGET_MS` 时按比例自动降 LOD，客户端档位为上限，有余量每帧最多回升 15%；新会话前 3 帧跳过调整 | 3 ms 强制预算：full 11.9 ms → 25%（8.5 ms）→ 9%（6.8 ms）→ 5% 地板（稳定 5.5 ms）；默认 33 ms 预算下 full 档 9.7 ms 不变档 |
 | 旧帧重传抑制 | 相机静止时 MJPEG 流不再重复传输已渲染的帧 | 空闲流 4 秒仅 1 帧 |
-| JPEG 编码后端可选 | 默认 Pillow（实测比 `cv2.imencode` 快约 1.6 倍：960×540 7.2 vs 11.7 ms，1920×1080 28.2 vs 46.2 ms），`LUMA_JPEG_BACKEND=opencv` 可切换 | 960×540 编码 ≈ 3.3 ms |
+| 多会话 CUDA stream 并发 | 移除渲染路径全局锁，每个渲染调用从流池取独立 `torch.cuda.Stream`（池大小 = 会话上限），仅模型加载保留互斥 | 相机 50ms 更新下：单会话 19.6 fps，双会话各 19.3 fps，四会话各 18.9 fps（与单会话持平，无头程阻塞） |
+| 空间 LOD（八叉树叶选择） | 加载时按二分网格（≈512 点/叶，1.16M 点 → 4096 叶）分组，每帧视锥裁剪 + 投影尺寸贪心选择，在客户端 LOD 预算内优先近处细节；纯 numpy <1.5ms，失败自动回退重要性前缀 | 25% 预算（960×540）：选 297K 点，选择 1.05 ms，渲染 10.7 ms；近景自动剔除视外叶（同预算仅 68K 点入栅格化） |
+| 客户端混合渲染 | 服务端导出 25% 粗模（`GET /api/model.splat`，32 字节/点），前端叠加画布本地渲染；拖动/缩放时即时显示本地预览，服务端帧到达且停止拖动即淡出；相机参数与服务端 `view_matrix` 同式映射 | 9.3 MB 粗模下载一次；58K 点解析 + 上传 506 ms；拖动期间本地即时反馈（浏览器实测像素差分验证） |
 
-未实现项见 [大规模场景路线](docs/LARGE_SCENES.md)：空间自适应 LOD（八叉树 + 屏幕空间误差）、out-of-core 分块流式加载、深度排序缓存、多会话 CUDA stream 并发、WebRTC 低延迟传输。
+未实现项见 [大规模场景路线](docs/LARGE_SCENES.md)：out-of-core 分块流式加载、深度排序缓存、WebRTC 低延迟传输。
 
 ## 4. 前后端联调与访问
 

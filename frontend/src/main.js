@@ -46,6 +46,8 @@ let serverMetricsTimer = null;
 let streamedFrames = 0;
 let streamFpsStartedAt = performance.now();
 let serverDrag = null;
+let hybridViewer = null;
+let hybridPreviewGen = null;
 const serverCamera = { yaw: 0, pitch: 0, distance: 6 };
 const API_BASE = window.LUMA_RENDER_API || window.location.origin;
 
@@ -133,6 +135,7 @@ async function switchMode(mode) {
     await connectServer();
   } else {
     await closeServerSession();
+    void disposeHybridPreview();
     els.serverViewport.classList.remove('ready');
     els.serverFrame.removeAttribute('src');
     if (serverFrameUrl) URL.revokeObjectURL(serverFrameUrl);
@@ -161,6 +164,7 @@ function applyServerModel(model) {
   els.toolbar.classList.add('visible');
   els.controlHint.classList.add('visible');
   els.serverViewport.classList.add('ready');
+  void loadHybridPreview();
 }
 
 async function connectServer() {
@@ -260,6 +264,91 @@ async function pollServerMetrics() {
   } catch (_) { /* the image stream remains authoritative */ }
 }
 
+// ── 混合渲染：服务端模式下的本地粗模预览 ──
+// 拉取服务端导出的粗模 .splat（25% LOD），在叠加画布上跑本地
+// gaussian-splats-3d 实例。拖动/缩放时立即显示本地预览获得即时反馈，
+// 对应服务端帧到达且不再拖动时隐藏。
+function hybridPreviewElement() {
+  let host = document.getElementById('serverPreview');
+  if (!host) {
+    host = document.createElement('div');
+    host.id = 'serverPreview';
+    els.serverViewport.prepend(host);
+  }
+  return host;
+}
+
+async function loadHybridPreview() {
+  if (renderLocation !== 'server' || !serverStatus || hybridViewer) return;
+  const generation = serverStatus.model_generation ?? `${serverStatus.name}:${serverStatus.bytes}`;
+  if (hybridPreviewGen === generation) return;
+  try {
+    const lib = await loadClientRenderer();
+    const response = await fetch(`${API_BASE}/api/model.splat?frac=0.25`, { signal: AbortSignal.timeout(30000) });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const blobUrl = URL.createObjectURL(new Blob([await response.arrayBuffer()], { type: 'application/octet-stream' }));
+    const preview = new lib.Viewer({
+      rootElement: hybridPreviewElement(),
+      cameraUp: [0, 1, 0],
+      initialCameraPosition: [0, 0, serverStatus.radius * 2.6],
+      initialCameraLookAt: [0, 0, 0],
+      selfDrivenMode: true,
+      useBuiltInControls: true,
+      sharedMemoryForWorkers: false,
+      gpuAcceleratedSort: false,
+      enableSIMDInSort: true,
+      halfPrecisionCovariancesOnGPU: true,
+      sphericalHarmonicsDegree: 0,
+      sceneRevealMode: lib.SceneRevealMode.Instant,
+      renderMode: lib.RenderMode.Always,
+      antialiased: false
+    });
+    await preview.addSplatScene(blobUrl, {
+      format: lib.SceneFormat.Splat,
+      progressiveLoad: false,
+      showLoadingUI: false
+    });
+    URL.revokeObjectURL(blobUrl);
+    preview.start();
+    hybridViewer = preview;
+    hybridPreviewGen = generation;
+    syncHybridCamera();
+  } catch (error) {
+    console.warn('本地粗模预览不可用，退回纯服务端帧流:', error);
+    await disposeHybridPreview();
+  }
+}
+
+async function disposeHybridPreview() {
+  if (hybridViewer) {
+    const preview = hybridViewer;
+    hybridViewer = null;
+    hybridPreviewGen = null;
+    try { preview.stop(); } catch (_) { /* already stopped */ }
+    try { await preview.dispose(); } catch (_) { /* best-effort cleanup */ }
+  }
+  document.getElementById('serverPreview')?.remove();
+}
+
+function syncHybridCamera() {
+  if (!hybridViewer || !serverStatus) return;
+  const center = serverStatus.center || [0, 0, 0];
+  const { yaw, pitch, distance } = serverCamera;
+  const offset = [
+    Math.sin(yaw) * Math.cos(pitch) * distance,
+    Math.sin(pitch) * distance,
+    -Math.cos(yaw) * Math.cos(pitch) * distance
+  ];
+  hybridViewer.camera.position.set(center[0] + offset[0], center[1] + offset[1], center[2] + offset[2]);
+  hybridViewer.controls.target.set(center[0], center[1], center[2]);
+  hybridViewer.camera.lookAt(hybridViewer.controls.target);
+  hybridViewer.controls.update();
+}
+
+function setHybridVisible(visible) {
+  document.getElementById('serverPreview')?.classList.toggle('visible', visible);
+}
+
 async function openServerSession() {
   if (!serverSupportsStream || !serverStatus) return false;
   await closeServerSession();
@@ -282,6 +371,7 @@ async function openServerSession() {
         streamFpsStartedAt = now;
       }
       els.serverViewport.classList.add('ready');
+      if (!serverDrag) setHybridVisible(false);
     };
     els.serverFrame.src = new URL(payload.stream_url, API_BASE).href;
     serverMetricsTimer = setInterval(pollServerMetrics, 700);
@@ -350,6 +440,7 @@ async function requestServerRender(interactive = false) {
     els.serverFrame.onload = () => {
       if (serverFrameUrl) URL.revokeObjectURL(serverFrameUrl);
       serverFrameUrl = nextUrl;
+      if (!serverDrag) setHybridVisible(false);
     };
     els.serverFrame.src = nextUrl;
     updateStreamMetrics(JSON.parse(response.headers.get('X-Render-Stats') || '{}'));
@@ -612,6 +703,7 @@ window.addEventListener('drop', (event) => { event.preventDefault(); dragDepth =
 els.serverViewport.addEventListener('pointerdown', (event) => {
   if (renderLocation !== 'server' || !serverStatus) return;
   serverDrag = { x: event.clientX, y: event.clientY };
+  if (hybridViewer) { setHybridVisible(true); syncHybridCamera(); }
   els.serverViewport.setPointerCapture(event.pointerId);
 });
 els.serverViewport.addEventListener('pointermove', (event) => {
@@ -621,6 +713,7 @@ els.serverViewport.addEventListener('pointermove', (event) => {
   serverDrag = { x: event.clientX, y: event.clientY };
   serverCamera.yaw -= dx * 0.008;
   serverCamera.pitch = Math.max(-1.48, Math.min(1.48, serverCamera.pitch + dy * 0.008));
+  syncHybridCamera();
   scheduleServerRender(true);
 });
 els.serverViewport.addEventListener('pointerup', () => { serverDrag = null; scheduleServerRender(false); });
@@ -631,6 +724,7 @@ els.serverViewport.addEventListener('wheel', (event) => {
   const min = serverStatus.radius * 0.08;
   const max = serverStatus.radius * 20;
   serverCamera.distance = Math.max(min, Math.min(max, serverCamera.distance * Math.exp(event.deltaY * 0.001)));
+  if (hybridViewer) { setHybridVisible(true); syncHybridCamera(); }
   scheduleServerRender(true);
 }, { passive: false });
 
