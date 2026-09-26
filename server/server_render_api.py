@@ -178,7 +178,7 @@ class RendererState:
         physical_gpu: int,
         memory_fraction: float,
         min_free_mib: int,
-        spatial_lod: bool = True,
+        spatial_lod: bool = False,
         stream_count: int = 4,
     ):
         if not torch.cuda.is_available():
@@ -967,10 +967,10 @@ def main() -> int:
                         help="禁用服务端自适应 LOD，严格使用客户端请求的档位")
     parser.add_argument("--frame-budget-ms", type=float, default=33.0,
                         help="自适应 LOD 的目标帧时间预算，毫秒（默认 33 ≈ 30fps）")
-    parser.add_argument("--spatial-lod", dest="spatial_lod", action="store_true", default=True,
-                        help="按空间八叉树选择 LOD 叶节点（默认开启）")
+    parser.add_argument("--spatial-lod", dest="spatial_lod", action="store_true", default=False,
+                        help="按空间叶节点选择 LOD（实验性：近处贪心；对尺度均匀的表面模型会饿死远处覆盖，默认关闭）")
     parser.add_argument("--no-spatial-lod", dest="spatial_lod", action="store_false",
-                        help="禁用空间 LOD，LOD 只按重要性前缀截取")
+                        help="禁用空间 LOD，LOD 只按重要性前缀截取（默认行为）")
     args = parser.parse_args()
 
     args.upload_dir.mkdir(parents=True, exist_ok=True)
