@@ -2,6 +2,8 @@
 
 这是服务端 CUDA 3D Gaussian Splatting 的隔离环境与显存探针。依赖通过 `pip --target` 安装在项目专属的 `python/` 目录，不会修改系统 Python/CUDA，也不会停止服务器现有进程。
 
+完整的前置条件、国内镜像、无外网离线 wheel 下载、前后端联调和故障排查见[项目根目录 README](../README.md)。
+
 ## 组成
 
 - PyTorch 2.0.1 + CUDA 11.8（上海交大镜像）
@@ -11,9 +13,23 @@
 
 ## 运行
 
+联网安装：
+
+```bash
+APP_ROOT="$PWD" bash ./setup.sh
+```
+
+无外网容器先在联网设备执行 `bash ./download-wheels.sh`（Windows 可执行 `./download-wheels.ps1`），上传包含 `wheels/` 的 `server/` 目录后安装：
+
+```bash
+OFFLINE=1 APP_ROOT="$PWD" bash ./setup.sh
+```
+
+显存探针：
+
 ```bash
 cd /workspace/luma-server-render
-PHYSICAL_GPU=3 ./run-probe.sh
+PHYSICAL_GPU=3 bash ./run-probe.sh
 ```
 
 默认测试 1280×720、10K–1.2M 高斯点。结果写入 `benchmark-result.json`，最后成功场景写入同名 PNG。
@@ -30,7 +46,7 @@ PHYSICAL_GPU=3 ./run-probe.sh
 cd /workspace/luma-server-render
 PHYSICAL_GPU=3 \
 MODEL_PATH=/workspace/luma-server-render/models/model.ply \
-./run-render-server.sh
+bash ./run-render-server.sh
 ```
 
 默认 API 端口为 `8090`，接口包括：

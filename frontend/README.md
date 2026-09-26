@@ -17,7 +17,7 @@
 ## 本地运行
 
 ```bash
-npm install --registry=https://registry.npmmirror.com
+npm ci
 node scripts/generate-demo.mjs
 npm run dev
 ```
@@ -27,6 +27,14 @@ npm run dev
 ```bash
 npm run build
 ```
+
+构建后可直接启动静态站点（源码仓库使用 `dist/`，部署包可使用 `deploy/site/`）：
+
+```bash
+PORT=8088 bash ./deploy/run-viewer.sh
+```
+
+Node/Python 前置条件、国内镜像、服务端离线依赖和完整联调步骤见[项目根目录 README](../README.md)。
 
 浏览器回归测试使用本机 Chrome；其他平台通过 `CHROME_PATH` 指定可执行文件：
 

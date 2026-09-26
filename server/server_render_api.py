@@ -7,6 +7,7 @@ import argparse
 import gc
 import json
 import math
+import mimetypes
 import os
 import subprocess
 import threading
@@ -498,8 +499,38 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
             except Exception as exc:
                 self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+        elif self.app.site_dir is not None:
+            self.send_static(path, include_body=True)
         else:
             self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
+
+    def do_HEAD(self) -> None:
+        path = urlparse(self.path).path
+        if self.app.site_dir is not None and not path.startswith("/api/") and path != "/health":
+            self.send_static(path, include_body=False)
+        else:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.cors()
+            self.end_headers()
+
+    def send_static(self, request_path: str, include_body: bool) -> None:
+        relative = unquote(request_path).lstrip("/") or "index.html"
+        root = self.app.site_dir
+        candidate = (root / relative).resolve()
+        if not candidate.is_relative_to(root) or not candidate.is_file():
+            self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
+            return
+        content_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(candidate.stat().st_size))
+        cache_control = "no-cache" if candidate.name == "index.html" else "public, max-age=31536000, immutable"
+        self.send_header("Cache-Control", cache_control)
+        self.end_headers()
+        if include_body:
+            with candidate.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    self.wfile.write(chunk)
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
@@ -638,13 +669,14 @@ class RenderServer(ThreadingHTTPServer):
 
     def __init__(
         self, address, state: RendererState, upload_dir: Path, max_upload_bytes: int,
-        max_sessions: int, session_ttl: int,
+        max_sessions: int, session_ttl: int, site_dir: Path | None = None,
     ):
         super().__init__(address, ApiHandler)
         self.state = state
         self.upload_dir = upload_dir
         self.max_upload_bytes = max_upload_bytes
         self.sessions = SessionRegistry(max_sessions, session_ttl)
+        self.site_dir = site_dir.resolve() if site_dir is not None else None
         self.app = self
 
 
@@ -660,6 +692,7 @@ def main() -> int:
     parser.add_argument("--session-ttl", type=int, default=120)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--upload-dir", type=Path, default=Path("uploads"))
+    parser.add_argument("--site-dir", type=Path)
     args = parser.parse_args()
 
     args.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -667,9 +700,12 @@ def main() -> int:
     if args.model:
         metadata = state.load(args.model)
         print(f"Loaded {metadata['name']}: {metadata['gaussians']:,} Gaussians", flush=True)
+    if args.site_dir is not None and not (args.site_dir / "index.html").is_file():
+        raise FileNotFoundError(f"Viewer site is missing: {args.site_dir}")
     server = RenderServer(
         (args.host, args.port), state, args.upload_dir.resolve(),
         int(args.max_upload_gib * 1024**3), max(1, args.max_sessions), max(30, args.session_ttl),
+        args.site_dir,
     )
     print(f"Server renderer listening on {args.host}:{args.port}", flush=True)
     server.serve_forever()

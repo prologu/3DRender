@@ -47,8 +47,7 @@ let streamedFrames = 0;
 let streamFpsStartedAt = performance.now();
 let serverDrag = null;
 const serverCamera = { yaw: 0, pitch: 0, distance: 6 };
-const apiPort = location.port === '18088' ? '18090' : '8090';
-const API_BASE = window.LUMA_RENDER_API || `${location.protocol}//${location.hostname}:${apiPort}`;
+const API_BASE = window.LUMA_RENDER_API || window.location.origin;
 
 function hasWebGL2() {
   const canvas = document.createElement('canvas');

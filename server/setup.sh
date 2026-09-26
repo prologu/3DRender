@@ -5,24 +5,45 @@ APP_ROOT="${APP_ROOT:-/workspace/luma-server-render}"
 DEPS="$APP_ROOT/python"
 TUNA="https://pypi.tuna.tsinghua.edu.cn/simple"
 TORCH_WHEEL="https://mirror.sjtu.edu.cn/pytorch-wheels/cu118/torch-2.0.1%2Bcu118-cp310-cp310-linux_x86_64.whl"
+TORCH_FILENAME="torch-2.0.1+cu118-cp310-cp310-linux_x86_64.whl"
 GSPLAT_FILENAME="gsplat-1.5.3+pt20cu118-cp310-cp310-linux_x86_64.whl"
-LOCAL_GSPLAT_WHEEL="$APP_ROOT/wheels/$GSPLAT_FILENAME"
+WHEEL_DIR="$APP_ROOT/wheels"
+LOCAL_TORCH_WHEEL="$WHEEL_DIR/$TORCH_FILENAME"
+LOCAL_GSPLAT_WHEEL="$WHEEL_DIR/$GSPLAT_FILENAME"
 GSPLAT_WHEEL_URL="https://github.com/nerfstudio-project/gsplat/releases/download/v1.5.3/gsplat-1.5.3%2Bpt20cu118-cp310-cp310-linux_x86_64.whl"
+REQUIREMENTS="$APP_ROOT/requirements-cu118.txt"
+
+PYTHON_ABI="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+if [[ "$PYTHON_ABI" != "3.10" ]]; then
+  echo "Python 3.10 is required by the pinned cp310 PyTorch/gsplat wheels; found $PYTHON_ABI" >&2
+  exit 1
+fi
+if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
+  echo "This server runtime requires Linux x86_64" >&2
+  exit 1
+fi
 
 mkdir -p "$DEPS"
-python3 -m pip install --upgrade --target "$DEPS" pip setuptools wheel -i "$TUNA"
-python3 -m pip install --upgrade --target "$DEPS" "$TORCH_WHEEL" --no-deps
-python3 -m pip install --upgrade --target "$DEPS" --no-deps \
-  filelock==3.16.1 typing-extensions==4.12.2 sympy==1.13.3 mpmath==1.3.0 \
-  networkx==3.4.2 jinja2==3.1.6 markupsafe==3.0.2 triton==2.0.0 \
-  numpy==1.26.4 pillow==10.4.0 ninja==1.11.1.1 packaging==24.2 \
-  jaxtyping==0.2.36 typeguard==2.13.3 wadler-lindig==0.1.7 \
-  rich==13.9.4 markdown-it-py==3.0.0 mdurl==0.1.2 pygments==2.18.0 \
-  -i "$TUNA"
-if [[ -f "$LOCAL_GSPLAT_WHEEL" ]]; then
+if [[ "${OFFLINE:-0}" == "1" ]]; then
+  for required in "$LOCAL_TORCH_WHEEL" "$LOCAL_GSPLAT_WHEEL" "$REQUIREMENTS"; do
+    if [[ ! -f "$required" ]]; then
+      echo "Missing offline dependency: $required" >&2
+      exit 1
+    fi
+  done
+  python3 -m pip install --upgrade --target "$DEPS" --no-deps \
+    --no-index --find-links "$WHEEL_DIR" -r "$REQUIREMENTS"
+  python3 -m pip install --upgrade --target "$DEPS" "$LOCAL_TORCH_WHEEL" --no-deps
   python3 -m pip install --upgrade --target "$DEPS" "$LOCAL_GSPLAT_WHEEL" --no-deps
 else
-  python3 -m pip install --upgrade --target "$DEPS" "$GSPLAT_WHEEL_URL" --no-deps
+  python3 -m pip install --upgrade --target "$DEPS" pip setuptools wheel -i "$TUNA"
+  python3 -m pip install --upgrade --target "$DEPS" "$TORCH_WHEEL" --no-deps
+  python3 -m pip install --upgrade --target "$DEPS" --no-deps -r "$REQUIREMENTS" -i "$TUNA"
+  if [[ -f "$LOCAL_GSPLAT_WHEEL" ]]; then
+    python3 -m pip install --upgrade --target "$DEPS" "$LOCAL_GSPLAT_WHEEL" --no-deps
+  else
+    python3 -m pip install --upgrade --target "$DEPS" "$GSPLAT_WHEEL_URL" --no-deps
+  fi
 fi
 
 PYTHONPATH="$DEPS" python3 - <<'PY'

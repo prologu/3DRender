@@ -16,13 +16,18 @@ args=(
   --physical-gpu "$PHYSICAL_GPU"
   --memory-fraction "${MEMORY_FRACTION:-0.045}"
   --min-free-mib "${MIN_FREE_MIB:-1750}"
+  --max-upload-gib "${MAX_UPLOAD_GIB:-2.0}"
   --max-sessions "${MAX_SESSIONS:-4}"
   --session-ttl "${SESSION_TTL:-120}"
-  --upload-dir "$APP_ROOT/uploads"
+  --upload-dir "${UPLOAD_DIR:-$APP_ROOT/uploads}"
 )
 
 if [[ -n "$MODEL_PATH" ]]; then
   args+=(--model "$MODEL_PATH")
+fi
+
+if [[ -n "${SITE_DIR:-}" ]]; then
+  args+=(--site-dir "$SITE_DIR")
 fi
 
 exec python3 "$APP_ROOT/server_render_api.py" "${args[@]}"
