@@ -48,6 +48,7 @@ PHYSICAL_GPU=3 \
 MODEL_PATH=/workspace/luma-server-render/models/model.ply \
 bash ./run-render-server.sh
 ```
+解释器默认取 PATH 中的 `python3`；conda 等隔离部署用 `LUMA_PYTHON=/path/to/python3` 显式指定（脚本不激活任何环境）。
 
 默认 API 端口为 `8090`，接口包括：
 
@@ -59,6 +60,7 @@ bash ./run-render-server.sh
 - `POST /api/session/{id}/camera`：切换 preview / balanced / full LOD 并更新视角
 
 默认 LOD 是 25% / 55% / 100% 的稳定嵌套集合。`MAX_SESSIONS` 默认 4，`SESSION_TTL` 默认 120 秒；空闲会话不持续占用 GPU。
+服务端另有自适应帧预算（默认开启）：按每帧实际耗时（渲染+编码）对照 `FRAME_BUDGET_MS`（默认 33 ms ≈ 30fps）自动升降 LOD 比例，客户端请求的档位作为上限，有余量时逐步回升；`AUTO_LOD=false` 禁用。新会话前 3 帧跳过调整，避开显存分配与内核加载的瞬时尖峰。相机静止时 MJPEG 流不再重复传输旧帧。
 
 Docker 未发布端口时，在访问设备建立转发：
 

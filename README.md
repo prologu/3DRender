@@ -7,7 +7,7 @@
 | 浏览器本地渲染 | 用户浏览器 / WebGL 2 | `.ply`、`.splat`、`.ksplat`、`.spz` | 快速查看、无需后端、文件不上传 |
 | GPU 服务端渲染 | Linux + NVIDIA GPU + gsplat | 标准 binary little-endian 3DGS `.ply` | 低配置客户端、大模型、统一算力 |
 
-服务端模式包含 MJPEG 长连接、相机状态合并以及 preview / balanced / full 自适应 LOD。当前 LOD 会减少每帧参与光栅化的 Gaussian 数量，但完整模型仍需常驻 GPU；城市级和亿级 Gaussian 的空间分块流式方案见 [大规模场景路线](docs/LARGE_SCENES.md)。
+服务端模式包含 MJPEG 长连接、相机状态合并（latest-camera-wins）以及 preview / balanced / full 自适应 LOD，并有服务端帧预算：每帧实际耗时超过 `FRAME_BUDGET_MS` 时在客户端请求档位内自动降低 LOD 比例保护帧率；相机静止时不再重复传输旧帧。当前 LOD 会减少每帧参与光栅化的 Gaussian 数量，但完整模型仍需常驻 GPU；城市级和亿级 Gaussian 的空间分块流式方案见 [大规模场景路线](docs/LARGE_SCENES.md)。
 
 ## 目录
 
@@ -96,7 +96,7 @@ PORT=8088 bash ./deploy/run-viewer.sh
 - Linux x86_64，已验证 Ubuntu 22.04。
 - CPython 3.10；预编译 wheel 名称包含 `cp310`，其他 Python 版本不能直接使用。
 - NVIDIA 驱动可运行 CUDA 11.8 构建的 PyTorch，先确认 `nvidia-smi` 正常。
-- 已验证组合：PyTorch `2.0.1+cu118`、gsplat `1.5.3+pt20cu118`、NumPy `1.26.4`、Pillow `10.4.0`。
+- 已验证组合：PyTorch `2.0.1+cu118`、gsplat `1.5.3+pt20cu118`、NumPy `1.26.4`、Pillow `10.4.0`、setuptools `80.10.2`（必须 <81，setuptools 81 移除了渲染路径用到的 `pkg_resources`）；`opencv-python-headless` 可选，个别构建上作为更快的 JPEG 后端（`LUMA_JPEG_BACKEND=opencv`）。
 - 依赖安装到 `server/python/`，不修改系统 Python，也不创建或停止系统服务。
 
 建议先检查：
@@ -161,6 +161,17 @@ MODEL_PATH=/absolute/path/model.ply \
 bash ./run-render-server.sh
 ```
 
+专用 GPU 机器（如单卡 A5000）建议用隔离 conda 环境并提高显存预算：
+
+```bash
+conda create -n luma python=3.10 -y
+LUMA_PYTHON="$HOME/miniconda3/envs/luma/bin/python3" \
+PHYSICAL_GPU=0 \
+MEMORY_FRACTION=0.25 \
+MODEL_PATH=/absolute/path/model.ply \
+bash ./run-render-server.sh
+```
+
 常用环境变量：
 
 | 变量 | 默认值 | 含义 |
@@ -168,11 +179,15 @@ bash ./run-render-server.sh
 | `PHYSICAL_GPU` | `3` | 绑定的物理 GPU 编号 |
 | `RENDER_PORT` | `8090` | API 监听端口 |
 | `MODEL_PATH` | 空 | 启动时加载的标准 3DGS PLY |
-| `MEMORY_FRACTION` | `0.045` | PyTorch 单进程显存比例上限 |
+| `MEMORY_FRACTION` | `0.045` | PyTorch 单进程显存比例上限；共享 GPU 保持保守，专用 GPU 可提到 `0.25`+（24G 卡 ≈ 6 GiB，可常驻约 50M SH0 点） |
 | `MIN_FREE_MIB` | `1750` | 加载和渲染前要求的最小空闲显存 |
 | `MAX_UPLOAD_GIB` | `2.0` | 单个上传模型的大小上限 |
 | `MAX_SESSIONS` | `4` | 最大交互会话数 |
 | `SESSION_TTL` | `120` | 无流连接会话的回收秒数，最低 30 |
+| `FRAME_BUDGET_MS` | `33` | 服务端自适应 LOD 的目标帧时间预算（毫秒），默认 33 ≈ 30fps |
+| `AUTO_LOD` | `true` | 启用服务端自适应 LOD；`false` 时严格使用客户端请求的档位 |
+| `LUMA_PYTHON` | `python3` | 启动使用的 Python 解释器（隔离部署指向 conda 环境路径） |
+| `LUMA_JPEG_BACKEND` | `pillow` | JPEG 编码后端，可设 `opencv`（需装 opencv-python-headless） |
 | `UPLOAD_DIR` | `server/uploads` | 上传文件保存目录 |
 
 显存比例不是模型容量保证。应根据模型 Gaussian 数、分辨率和同卡已有任务保守调整；脚本不会自动结束其他进程。
@@ -185,6 +200,18 @@ curl http://127.0.0.1:8090/api/status
 ```
 
 主要接口：`POST /api/model`、`POST /api/render`、`POST /api/session`、`POST /api/session/{id}/camera`、`GET /api/session/{id}/stream`。请求细节见 [技术架构](docs/ARCHITECTURE.md)。
+
+### 性能优化（服务端帧流水线）
+
+当前版本已实现，A5000 部署实测（1.16M Gaussian 场景，960×540，full LOD）：
+
+| 优化 | 行为 | 实测数据 |
+| --- | --- | --- |
+| 服务端自适应 LOD | 帧耗时超过 `FRAME_BUDGET_MS` 时按比例自动降 LOD，客户端档位为上限，有余量每帧最多回升 15%；新会话前 3 帧跳过调整 | 3 ms 强制预算：full 11.9 ms → 25%（8.5 ms）→ 9%（6.8 ms）→ 5% 地板（稳定 5.5 ms）；默认 33 ms 预算下 full 档 9.7 ms 不变档 |
+| 旧帧重传抑制 | 相机静止时 MJPEG 流不再重复传输已渲染的帧 | 空闲流 4 秒仅 1 帧 |
+| JPEG 编码后端可选 | 默认 Pillow（实测比 `cv2.imencode` 快约 1.6 倍：960×540 7.2 vs 11.7 ms，1920×1080 28.2 vs 46.2 ms），`LUMA_JPEG_BACKEND=opencv` 可切换 | 960×540 编码 ≈ 3.3 ms |
+
+未实现项见 [大规模场景路线](docs/LARGE_SCENES.md)：空间自适应 LOD（八叉树 + 屏幕空间误差）、out-of-core 分块流式加载、深度排序缓存、多会话 CUDA stream 并发、WebRTC 低延迟传输。
 
 ## 4. 前后端联调与访问
 
