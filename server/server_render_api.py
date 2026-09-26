@@ -23,18 +23,21 @@ import numpy as np
 import torch
 from PIL import Image
 from gsplat import rasterization
-# 快速 JPEG 编码：OpenCV（libjpeg-turbo SIMD）可用时优先，否则回退 Pillow。
+# JPEG 编码后端：Pillow 默认（实测比 cv2.imencode 快约 1.6 倍）；
+# 个别构建上 OpenCV 更快的机器可设 LUMA_JPEG_BACKEND=opencv 切换。
 try:
     import cv2
-    _JPEG_BACKEND = "opencv"
 except ImportError:
     cv2 = None
-    _JPEG_BACKEND = "pillow"
+_JPEG_BACKEND = "opencv" if (
+    cv2 is not None
+    and os.environ.get("LUMA_JPEG_BACKEND", "").lower() == "opencv"
+) else "pillow"
 
 
 def encode_jpeg(pixels: np.ndarray, quality: int) -> bytes:
-    """将 RGB 帧编码为 JPEG。OpenCV 后端显著更快且不占满 CPU 核心。"""
-    if cv2 is not None:
+    """将 RGB 帧编码为 JPEG。后端由模块级 _JPEG_BACKEND 决定。"""
+    if _JPEG_BACKEND == "opencv":
         bgr = np.ascontiguousarray(pixels[:, :, ::-1])
         ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
         if not ok:
