@@ -19,6 +19,7 @@ args=(
   --max-upload-gib "${MAX_UPLOAD_GIB:-2.0}"
   --max-sessions "${MAX_SESSIONS:-4}"
   --session-ttl "${SESSION_TTL:-120}"
+  --frame-budget-ms "${FRAME_BUDGET_MS:-33}"
   --upload-dir "${UPLOAD_DIR:-$APP_ROOT/uploads}"
 )
 
@@ -29,5 +30,11 @@ fi
 if [[ -n "${SITE_DIR:-}" ]]; then
   args+=(--site-dir "$SITE_DIR")
 fi
+if [[ "${AUTO_LOD:-true}" == "false" ]]; then
+  args+=(--no-auto-lod)
+fi
 
-exec python3 "$APP_ROOT/server_render_api.py" "${args[@]}"
+
+# 解释器可覆盖：部署环境用 LUMA_PYTHON 指定（如 conda 环境路径），默认取 PATH 中的 python3。
+LUMA_PYTHON="${LUMA_PYTHON:-python3}"
+exec "$LUMA_PYTHON" "$APP_ROOT/server_render_api.py" "${args[@]}"

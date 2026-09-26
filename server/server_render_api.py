@@ -15,6 +15,7 @@ import time
 import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -22,6 +23,26 @@ import numpy as np
 import torch
 from PIL import Image
 from gsplat import rasterization
+# 快速 JPEG 编码：OpenCV（libjpeg-turbo SIMD）可用时优先，否则回退 Pillow。
+try:
+    import cv2
+    _JPEG_BACKEND = "opencv"
+except ImportError:
+    cv2 = None
+    _JPEG_BACKEND = "pillow"
+
+
+def encode_jpeg(pixels: np.ndarray, quality: int) -> bytes:
+    """将 RGB 帧编码为 JPEG。OpenCV 后端显著更快且不占满 CPU 核心。"""
+    if cv2 is not None:
+        bgr = np.ascontiguousarray(pixels[:, :, ::-1])
+        ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+        if not ok:
+            raise RuntimeError("OpenCV JPEG 编码失败")
+        return buf.tobytes()
+    buffer = BytesIO()
+    Image.fromarray(pixels, "RGB").save(buffer, format="JPEG", quality=quality, optimize=False)
+    return buffer.getvalue()
 
 
 SH_C0 = 0.28209479177387814
@@ -225,6 +246,18 @@ class RendererState:
             name = "full"
         return levels[name], name
 
+    def lod_fraction(self, lod: object) -> float:
+        """把客户端 LOD 请求（名称或比例）解析成 0.05-1.0 的比例上限。"""
+        if self.metadata is None:
+            return 1.0
+        levels = self.metadata["lod_levels"]
+        if isinstance(lod, (int, float)) and not isinstance(lod, bool):
+            return float(np.clip(float(lod), 0.05, 1.0))
+        name = str(lod).lower()
+        if name in ("preview", "balanced"):
+            return levels[name] / levels["full"]
+        return 1.0
+
     @staticmethod
     def view_matrix(center: np.ndarray, yaw: float, pitch: float, distance: float) -> np.ndarray:
         pitch = float(np.clip(pitch, -1.48, 1.48))
@@ -305,12 +338,8 @@ class RendererState:
                 torch.cuda.empty_cache()
                 raise RuntimeError("服务端渲染达到显存保护上限") from exc
 
-        from io import BytesIO
         encode_started = time.perf_counter()
-        buffer = BytesIO()
-        Image.fromarray(pixels, "RGB").save(
-            buffer, format="JPEG", quality=jpeg_quality, optimize=False
-        )
+        image_bytes = encode_jpeg(pixels, jpeg_quality)
         encode_ms = (time.perf_counter() - encode_started) * 1000.0
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         stats = {
@@ -321,12 +350,13 @@ class RendererState:
             "height": height,
             "gaussians": gaussian_count,
             "lod": lod_name,
-            "jpeg_bytes": buffer.tell(),
+            "jpeg_bytes": len(image_bytes),
+            "jpeg_backend": _JPEG_BACKEND,
             "peak_allocated_mib": round(torch.cuda.max_memory_allocated(self.device) / 2**20, 1),
             "peak_reserved_mib": round(torch.cuda.max_memory_reserved(self.device) / 2**20, 1),
             "yaw": yaw, "pitch": pitch, "distance": distance,
         }
-        return buffer.getvalue(), stats
+        return image_bytes, stats
 
 
 class RenderSession:
@@ -341,6 +371,9 @@ class RenderSession:
         self.stream_attached = False
         self.last_seen = time.monotonic()
         self.stats: dict | None = None
+        # 服务端自适应 LOD：在客户端 LOD 上限内按帧时间预算升降档。
+        self.auto_fraction: float | None = None
+        self.auto_frames = 0
 
     def update(self, request: dict) -> int:
         with self.condition:
@@ -615,12 +648,36 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if item is None:
                     break
                 request, revision = item
-                if revision > rendered_revision:
-                    last_image, last_stats = self.app.state.render(request)
-                    rendered_revision = revision
-                    session.stats = {**last_stats, "revision": revision}
-                if last_image is None:
+                if revision <= rendered_revision:
+                    # 相机静止：没有新帧可发，不再重复传输旧帧（省 CPU/带宽/解码）。
+                    time.sleep(0.05)
                     continue
+                active_request = request
+                if self.app.auto_lod:
+                    ceiling = self.app.state.lod_fraction(request.get("lod", "full"))
+                    if session.auto_fraction is None:
+                        session.auto_fraction = ceiling
+                    session.auto_fraction = min(session.auto_fraction, ceiling)
+                    active_request = {**request, "lod": round(session.auto_fraction, 4)}
+                last_image, last_stats = self.app.state.render(active_request)
+                rendered_revision = revision
+                if self.app.auto_lod:
+                    session.auto_frames += 1
+                    budget = self.app.frame_budget_ms
+                    # 前 3 帧跳过调整，避开显存分配/内核加载的瞬时尖峰。
+                    if session.auto_frames > 3:
+                        rt = last_stats["render_ms"]
+                        if rt > budget * 1.2:
+                            # 超预算：按超出比例同比例降档（快速保帧率）。
+                            session.auto_fraction = max(
+                                0.05, session.auto_fraction * budget / max(rt, 1.0))
+                        elif rt < budget * 0.5:
+                            # 有余量：每帧最多升 15%，逐步细化回客户端要求的档位。
+                            session.auto_fraction = min(ceiling, session.auto_fraction * 1.15)
+                session.stats = {
+                    **last_stats, "revision": revision,
+                    "lod_auto": round(session.auto_fraction, 3) if self.app.auto_lod else None,
+                }
                 stats_header = json.dumps(last_stats or {}, separators=(",", ":"))
                 headers = (
                     "--frame\r\n"
@@ -670,6 +727,7 @@ class RenderServer(ThreadingHTTPServer):
     def __init__(
         self, address, state: RendererState, upload_dir: Path, max_upload_bytes: int,
         max_sessions: int, session_ttl: int, site_dir: Path | None = None,
+        auto_lod: bool = True, frame_budget_ms: float = 33.0,
     ):
         super().__init__(address, ApiHandler)
         self.state = state
@@ -677,6 +735,8 @@ class RenderServer(ThreadingHTTPServer):
         self.max_upload_bytes = max_upload_bytes
         self.sessions = SessionRegistry(max_sessions, session_ttl)
         self.site_dir = site_dir.resolve() if site_dir is not None else None
+        self.auto_lod = auto_lod
+        self.frame_budget_ms = frame_budget_ms
         self.app = self
 
 
@@ -693,6 +753,12 @@ def main() -> int:
     parser.add_argument("--model", type=Path)
     parser.add_argument("--upload-dir", type=Path, default=Path("uploads"))
     parser.add_argument("--site-dir", type=Path)
+    parser.add_argument("--auto-lod", dest="auto_lod", action="store_true", default=True,
+                        help="按帧时间预算在服务端自动升降 LOD（默认开启）")
+    parser.add_argument("--no-auto-lod", dest="auto_lod", action="store_false",
+                        help="禁用服务端自适应 LOD，严格使用客户端请求的档位")
+    parser.add_argument("--frame-budget-ms", type=float, default=33.0,
+                        help="自适应 LOD 的目标帧时间预算，毫秒（默认 33 ≈ 30fps）")
     args = parser.parse_args()
 
     args.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -705,7 +771,7 @@ def main() -> int:
     server = RenderServer(
         (args.host, args.port), state, args.upload_dir.resolve(),
         int(args.max_upload_gib * 1024**3), max(1, args.max_sessions), max(30, args.session_ttl),
-        args.site_dir,
+        args.site_dir, args.auto_lod, args.frame_budget_ms,
     )
     print(f"Server renderer listening on {args.host}:{args.port}", flush=True)
     server.serve_forever()
