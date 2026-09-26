@@ -244,6 +244,8 @@ class RendererState:
             "bb_max": bb_max_c,
             "centroid": (bb_min_c + bb_max_c) * 0.5,
             "diag": diag,
+            "vis": np.zeros(count, dtype=np.int32),
+            "token": 0,
         }
 
     def _spatial_select(
@@ -430,9 +432,20 @@ class RendererState:
         spatial_ms = 0.0
         if gaussian_count < full_count and self.spatial_lod and self.spatial is not None:
             select_started = time.perf_counter()
-            selection = self._spatial_select(view, fov, width, height, gaussian_count)
-            spatial_ms = (time.perf_counter() - select_started) * 1000.0
+            reserve = max(1, int(gaussian_count * 0.5))
+            selection = self._spatial_select(
+                view, fov, width, height, max(1, gaussian_count - reserve))
             if selection is not None:
+                # 两级选择：一半预算保留全局重要性前缀（保证全场景基础覆盖、
+                # 防止远处可见空洞），另一半给空间近处叶节点叠加局部细节。
+                # 时间戳标记法只遍历被选中的点，复杂度 O(选定点数)。
+                if reserve < len(selection):
+                    token = self.spatial["token"] + 1
+                    self.spatial["vis"][selection] = token
+                    self.spatial["token"] = token
+                    prefix_new = np.flatnonzero(self.spatial["vis"][:reserve] != token)
+                    selection = np.concatenate([selection, prefix_new])
+                spatial_ms = (time.perf_counter() - select_started) * 1000.0
                 lod_strategy = "spatial"
         jpeg_quality = int(np.clip(int(request.get("jpeg_quality", 88)), 55, 95))
         started = time.perf_counter()
@@ -543,6 +556,7 @@ class RenderSession:
         # 服务端自适应 LOD：在客户端 LOD 上限内按帧时间预算升降档。
         self.auto_fraction: float | None = None
         self.auto_frames = 0
+        self.last_rt: float | None = None
 
     def update(self, request: dict) -> int:
         with self.condition:
@@ -844,10 +858,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                     ceiling = self.app.state.lod_fraction(request.get("lod", "full"))
                     if session.auto_fraction is None:
                         session.auto_fraction = ceiling
-                    session.auto_fraction = min(session.auto_fraction, ceiling)
+                    if ceiling > session.auto_fraction + 1e-6:
+                        # 相机刚停止（settle 帧）：客户端明确要求比当前自动档位更高的质量。
+                        # 仅当机器刚证明有余量（上一帧在预算内）或尚无参考帧时立即按该档
+                        # 渲染，避免低配机器上“升一档又降一档”的振荡；否则保持降档。
+                        if session.last_rt is None or session.last_rt <= self.app.frame_budget_ms:
+                            session.auto_fraction = ceiling
+                    else:
+                        session.auto_fraction = min(session.auto_fraction, ceiling)
                     active_request = {**request, "lod": round(session.auto_fraction, 4)}
                 last_image, last_stats = self.app.state.render(active_request)
                 rendered_revision = revision
+                session.last_rt = last_stats["render_ms"]
                 if self.app.auto_lod:
                     session.auto_frames += 1
                     budget = self.app.frame_budget_ms
