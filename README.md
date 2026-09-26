@@ -246,6 +246,34 @@ ssh -N -p 2223 \
 
 随后访问 `http://127.0.0.1:18088`。页面在 `18088` 运行时会自动连接 `18090`；常规部署会连接同一主机的 `8090`。生产环境应通过同域名 HTTPS 反向代理两个服务，并增加鉴权、限流和上传审计。
 
+### 人工启动 / 停止命令
+
+一键命令（A5000 部署，`/home/ljq/luma/run.sh` 为部署环境自带，不在仓库内；可从任意已配置 SSH 的机器直接粘贴执行）：
+
+```bash
+# 启动（预载测试模型，后台常驻，端口 8089）
+ssh A5000-tailscale-ljq 'cd /home/ljq/luma && MODEL_PATH=/home/ljq/luma/luma-stream-render-v2/uploads/4d3df23bcf5a48f88c83cd6a3ed02b24-rgb_rawlight_gaussian_gt_fixed.ply bash run.sh start'
+
+# 停止 / 查看状态
+ssh A5000-tailscale-ljq 'bash /home/ljq/luma/run.sh stop'
+ssh A5000-tailscale-ljq 'bash /home/ljq/luma/run.sh status'
+```
+
+没有 `run.sh` 时，等价的手工命令（在部署机上直接执行，效果与上面一致）：
+
+```bash
+cd /home/ljq/luma/luma-stream-render-v2
+MODEL_PATH=/absolute/path/to/model.ply \
+LUMA_PYTHON=/home/ljq/miniconda3/envs/luma/bin/python3 \
+MEMORY_FRACTION=0.25 \
+PHYSICAL_GPU=0 \
+PORT=8089 \
+setsid env PHYSICAL_GPU=0 bash run-web-renderer.sh > logs/server.log 2>&1 &
+```
+
+`MEMORY_FRACTION` 是显存占比上限：24G 卡取 `0.25` ≈ 6 GiB，可常驻约 50M 点；共享卡请降回 `0.045`。端口被占时启动器自动跳过，不会杀其他进程；停止用 `pkill -f "[s]erver_render_api.*8089"`。
+
+
 ## 5. 模型要求与异常 PLY 修复
 
 浏览器本地模式支持 `.ply`、`.splat`、`.ksplat`、`.spz`。服务端当前只接受标准 binary little-endian 3DGS PLY，至少包含：

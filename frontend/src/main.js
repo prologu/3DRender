@@ -48,7 +48,12 @@ let streamFpsStartedAt = performance.now();
 let serverDrag = null;
 let hybridViewer = null;
 let hybridPreviewGen = null;
+let serverDevice = null;
 const serverCamera = { yaw: 0, pitch: 0, distance: 6 };
+function deviceLabel() {
+  const name = (serverDevice || '').replace(/^NVIDIA\s+/i, '').trim();
+  return name || 'GPU';
+}
 const API_BASE = window.LUMA_RENDER_API || window.location.origin;
 
 function hasWebGL2() {
@@ -112,16 +117,16 @@ function updateModeUi() {
   els.viewport.classList.toggle('server-hidden', server);
   els.fileInput.accept = server ? '.ply' : '.ply,.splat,.ksplat,.spz';
   els.welcomeDescription.textContent = server
-    ? '模型上传到隔离渲染服务，由 V100 完成光栅化，客户端只接收图像。'
+    ? `模型上传到隔离渲染服务，由 ${deviceLabel()} 完成光栅化，客户端只接收图像。`
     : '所有模型均在当前设备本地解析与渲染，不上传服务器。';
   els.dropTitle.textContent = server ? '上传标准 3DGS PLY 到服务端' : '拖放 3DGS 模型到这里';
   els.dropSubtitle.textContent = server ? '当前支持 binary little-endian PLY' : '或点击从本地选择文件';
-  els.backendLabel.textContent = server ? 'V100 · gsplat' : 'WebGL 2';
+  els.backendLabel.textContent = server ? `${deviceLabel()} · gsplat` : 'WebGL 2';
   els.renderModeLabel.textContent = server ? 'Server Frame' : '3D Gaussian';
   els.privacyTitle.textContent = server ? '服务端模式' : '本地模式';
   els.privacyText.textContent = server ? '模型会上传到当前隔离容器' : '文件不会离开你的浏览器';
   els.controlHint.innerHTML = server
-    ? '<b>拖动</b> 旋转 <i></i><b>滚轮</b> 缩放 <i></i><b>V100</b> 渲染'
+    ? `<b>拖动</b> 旋转 <i></i><b>滚轮</b> 缩放 <i></i><b>${deviceLabel()}</b> 渲染`
     : '<b>左键</b> 旋转 <i></i><b>右键</b> 平移 <i></i><b>滚轮</b> 缩放';
 }
 
@@ -169,14 +174,16 @@ function applyServerModel(model) {
 
 async function connectServer() {
   els.webglBadge.classList.remove('ok', 'error');
-  els.webglBadge.lastChild.textContent = ' 连接 V100';
+  els.webglBadge.lastChild.textContent = ' 连接渲染服务';
   try {
     const response = await fetch(`${API_BASE}/api/status`, { signal: AbortSignal.timeout(8000) });
     const status = await response.json();
     if (!response.ok || !status.ok) throw new Error(status.error || '服务不可用');
+    serverDevice = status.device || null;
     serverSupportsStream = Boolean(status.capabilities?.mjpeg_stream);
+    updateModeUi();
     els.webglBadge.classList.add('ok');
-    els.webglBadge.lastChild.textContent = ` V100 就绪 · ${status.gpu.free_mib} MiB`;
+    els.webglBadge.lastChild.textContent = ` ${deviceLabel()} 就绪 · ${status.gpu.free_mib} MiB`;
     if (status.model) {
       applyServerModel(status.model);
       if (!await openServerSession()) await requestServerRender();
@@ -193,7 +200,7 @@ async function connectServer() {
 
 function uploadServerFile(file) {
   if (getExtension(file.name) !== 'ply') return showToast('服务端模式当前仅支持标准 3DGS PLY', true);
-  showLoading('正在上传到 V100', '准备传输模型…');
+  showLoading(`正在上传到 ${deviceLabel()}`, '准备传输模型…');
   els.openFileTop.disabled = true;
   const xhr = new XMLHttpRequest();
   xhr.open('POST', `${API_BASE}/api/model`);
@@ -227,7 +234,7 @@ async function finishServerUpload(error, model) {
   if (serverSupportsStream && !serverSession) await openServerSession();
   await requestServerRender();
   hideLoading();
-  showToast(`${model.name} 已由 V100 加载`);
+  showToast(`${model.name} 已由 ${deviceLabel()} 加载`);
 }
 
 function updateStreamMetrics(stats) {
@@ -347,6 +354,9 @@ function syncHybridCamera() {
 
 function setHybridVisible(visible) {
   document.getElementById('serverPreview')?.classList.toggle('visible', visible);
+  // 防重影：本地预览显示的是当前拖动相机，而服务端帧仍是上一时刻相机；
+  // 两者错位叠加就是“多帧重叠”。预览可见时隐藏服务端帧，预览淡出后恢复。
+  els.serverFrame.style.display = visible ? 'none' : '';
 }
 
 async function openServerSession() {
