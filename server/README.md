@@ -66,7 +66,7 @@ LOD 选点策略：客户端档位决定每帧 Gaussian 预算，**默认按重�
 多个交互会话在独立 CUDA stream 上并发渲染（流池大小 = `MAX_SESSIONS`）：渲染路径不再持有全局锁，只有模型加载/更换时才互斥；各会话的 GPU 工作在同卡上重叠执行，无头程阻塞。A5000 实测（1.16M 点、balanced 档、相机 50ms 更新）：单会话 19.6 fps，双会话各 19.3 fps，四会话各 18.9 fps。
 **自由 360° 旋转**：轨道相机的 `pitch` 不再钳位（旧版前后端双重钳在 ±1.48 rad，俯仰到约 ±85° 就卡住、只能转约 180°）。`yaw` 本就无界；`view_matrix` 用固定世界 up 向量构造，跨天顶/天底连续平滑无跳变，因此俯仰放开后可任意方向无缝转动（实测俯仰下发到 7.87 rad 仍正常渲染）。
 
-**前后左右移动（pan）**：`/api/render`、`/api/session`、`/api/session/{id}/camera` 接受 `pan=[x,y,z]`（世界系平移偏移，缺省 `[0,0,0]`），服务端 `center = 模型中心 + pan`，并按模型半径×8 截断，防止移出场景。前端导航盘/`WASD`/方向键沿相机本地方向（`forward`/`right`，`right = cross(worldUp, forward)`，与 `view_matrix` 一致）累计 `pan`，步长 `distance×0.02` 随缩放缩放，实现前后左右平移。
+**前后左右移动（pan）**：`/api/render`、`/api/session`、`/api/session/{id}/camera` 接受 `pan=[x,y,z]`（世界系平移偏移，缺省 `[0,0,0]`），服务端 `center = 模型中心 + pan`，并按模型半径×8 截断，防止移出场景。前端**左键拖动=旋转、右键拖动=移动（屏幕平面平移）**；导航盘/`WASD`/方向键沿**屏幕轴**累计 `pan`（`right = cross(worldUp, forward)`、`up = cross(forward, right)`，与服务端 `view_matrix` 完全同轴），步长 `distance×0.02` 随缩放缩放——移动方向始终与画面朝向一致，相机越过天顶/天底（俯仰超 ±90°）时不反向。
 
 **数值 LOD（高斯加载量滑杆）**：`lod` 除接受档位字符串（preview / balanced / full）外，也接受数值（如 `0.5` = 50% 点数），直接作为该帧点数比例上限（clip 到 0.05–1.0）。前端“高斯加载量”滑杆（10%–100%）即下发数值 `lod`，实时选择服务端加载点数比例；服务端自适应 LOD 仍在其之上按帧预算自动降档兜底（大场景满加载效率的双保险）。
 **流统计**：MJPEG 帧头的 `X-Render-Stats` 现在包含 `lod_auto`（自适应 LOD 实际档位）与 `revision`（相机版本号），便于前端展示真实渲染档位。

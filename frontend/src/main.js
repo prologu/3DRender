@@ -47,6 +47,7 @@ let serverMetricsTimer = null;
 let streamedFrames = 0;
 let streamFpsStartedAt = performance.now();
 let serverDrag = null;
+let serverPanDrag = null;   // 右键拖动平移（screen-plane pan），与左键旋转区分
 let hybridViewer = null;
 let hybridPreviewGen = null;
 // 本地粗模叠加层（拖动即时反馈）。默认关闭：服务端已可在帧预算内渲染全量点，
@@ -139,7 +140,7 @@ function updateModeUi() {
   els.privacyTitle.textContent = server ? '服务端模式' : '本地模式';
   els.privacyText.textContent = server ? '模型会上传到当前隔离容器' : '文件不会离开你的浏览器';
   els.controlHint.innerHTML = server
-    ? `<b>拖动</b> 旋转 <i></i><b>滚轮</b> 缩放 <i></i><b>${deviceLabel()}</b> 渲染`
+    ? `<b>左键拖动</b> 旋转 <i></i><b>右键拖动</b> 移动 <i></i><b>滚轮</b> 缩放 <i></i><b>WASD/方向键/导航盘</b> 移动`
     : '<b>左键</b> 旋转 <i></i><b>右键</b> 平移 <i></i><b>滚轮</b> 缩放';
 }
 
@@ -730,23 +731,49 @@ window.addEventListener('drop', (event) => { event.preventDefault(); dragDepth =
 
 els.serverViewport.addEventListener('pointerdown', (event) => {
   if (renderLocation !== 'server' || !serverStatus) return;
-  serverDrag = { x: event.clientX, y: event.clientY };
-  if (hybridViewer) { setHybridVisible(true); syncHybridCamera(); }
   els.serverViewport.setPointerCapture(event.pointerId);
+  if (event.button === 2) {
+    // 右键：屏幕平面平移（与左键旋转区分）
+    serverPanDrag = { x: event.clientX, y: event.clientY };
+  } else {
+    // 左键：旋转
+    serverDrag = { x: event.clientX, y: event.clientY };
+    if (hybridViewer) { setHybridVisible(true); syncHybridCamera(); }
+  }
 });
 els.serverViewport.addEventListener('pointermove', (event) => {
-  if (!serverDrag || renderLocation !== 'server') return;
-  const dx = event.clientX - serverDrag.x;
-  const dy = event.clientY - serverDrag.y;
-  serverDrag = { x: event.clientX, y: event.clientY };
-  const rot = rotationSpeed();
-  serverCamera.yaw -= dx * rot;
-  serverCamera.pitch += dy * rot;
-  syncHybridCamera();
-  scheduleServerRender(true);
+  if (renderLocation !== 'server') return;
+  if (serverDrag) {
+    const dx = event.clientX - serverDrag.x;
+    const dy = event.clientY - serverDrag.y;
+    serverDrag = { x: event.clientX, y: event.clientY };
+    const rot = rotationSpeed();
+    serverCamera.yaw -= dx * rot;
+    serverCamera.pitch += dy * rot;
+    syncHybridCamera();
+    scheduleServerRender(true);
+  }
+  if (serverPanDrag) {
+    const dx = event.clientX - serverPanDrag.x;
+    const dy = event.clientY - serverPanDrag.y;
+    serverPanDrag = { x: event.clientX, y: event.clientY };
+    const { right, up } = cameraMoveVectors();
+    const scale = (serverCamera.distance / Math.max(els.serverViewport.clientHeight || 720, 300)) * 0.6;
+    for (let i = 0; i < 3; i++) serverCamera.pan[i] += (-right[i] * dx + up[i] * dy) * scale;
+    scheduleServerRender(true);
+  }
 });
-els.serverViewport.addEventListener('pointerup', () => { serverDrag = null; scheduleServerRender(false); });
-els.serverViewport.addEventListener('pointercancel', () => { serverDrag = null; scheduleServerRender(false); });
+els.serverViewport.addEventListener('pointerup', () => {
+  const wasActive = serverDrag || serverPanDrag;
+  serverDrag = null; serverPanDrag = null;
+  if (wasActive) scheduleServerRender(false);
+});
+els.serverViewport.addEventListener('pointercancel', () => {
+  const wasActive = serverDrag || serverPanDrag;
+  serverDrag = null; serverPanDrag = null;
+  if (wasActive) scheduleServerRender(false);
+});
+els.serverViewport.addEventListener('contextmenu', (event) => { if (renderLocation === 'server') event.preventDefault(); });
 els.serverViewport.addEventListener('wheel', (event) => {
   if (renderLocation !== 'server' || !serverStatus) return;
   event.preventDefault();
@@ -757,24 +784,32 @@ els.serverViewport.addEventListener('wheel', (event) => {
   scheduleServerRender(true);
 }, { passive: false });
 
-// ===== 前后左右移动（pan）：按住按钮/方向键沿相机本地方向平移，步长随缩放缩放 =====
-let panDir = null;            // { f: 前后系数, r: 左右系数 }
+// ===== 前后左右移动（pan）：按住按钮/方向键沿“屏幕轴”平移。屏幕轴与服务端 view_matrix 完全一致，相机越过天顶/天底时也不会反向 =====
+let panDir = null;            // { u: 上下系数, r: 左右系数 }（屏幕轴）
 let activePanDirs = new Set();
 let panRaf = null;
-const navDirVectors = { up: { f: 1, r: 0 }, down: { f: -1, r: 0 }, left: { f: 0, r: -1 }, right: { f: 0, r: 1 } };
-// 相机本地移动方向（世界系），与服务端 view_matrix 一致。
+// 屏幕平面方向：up/down=屏幕上/下，left/right=屏幕左/右（始终与画面一致，不反向）
+const navDirVectors = { up: { u: 1, r: 0 }, down: { u: -1, r: 0 }, left: { u: 0, r: -1 }, right: { u: 0, r: 1 } };
+// 相机屏幕轴（世界系），与服务端 view_matrix 一致：right=cross(worldUp,forward)、up=cross(forward,right)
 function cameraMoveVectors() {
   const { yaw, pitch } = serverCamera;
   const forward = [-Math.sin(yaw) * Math.cos(pitch), -Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch)];
-  const right = [forward[2], 0, -forward[0]]; // cross(worldUp=(0,1,0), forward)
-  const n = Math.hypot(right[0], right[2]) || 1;
-  return { forward, right: [right[0] / n, 0, right[2] / n] };
+  let right = [forward[2], 0, -forward[0]]; // cross(worldUp=(0,1,0), forward)
+  const rn = Math.hypot(right[0], right[2]);
+  right = rn < 1e-4 ? [1, 0, 0] : [right[0] / rn, 0, right[2] / rn];
+  const up = [ // cross(forward, right) = 屏幕上
+    forward[1] * right[2] - forward[2] * right[1],
+    forward[2] * right[0] - forward[0] * right[2],
+    forward[0] * right[1] - forward[1] * right[0]
+  ];
+  const un = Math.hypot(up[0], up[1], up[2]) || 1;
+  return { forward, right, up: [up[0] / un, up[1] / un, up[2] / un] };
 }
 function recomputePanDir() {
   if (!activePanDirs.size) { panDir = null; return; }
-  let f = 0, r = 0;
-  for (const d of activePanDirs) { f += navDirVectors[d].f; r += navDirVectors[d].r; }
-  panDir = { f, r };
+  let u = 0, r = 0;
+  for (const d of activePanDirs) { u += navDirVectors[d].u; r += navDirVectors[d].r; }
+  panDir = { u, r };
 }
 function updatePanLoop() {
   if (panDir && !panRaf) panRaf = requestAnimationFrame(panTick);
@@ -783,9 +818,9 @@ function updatePanLoop() {
 function panTick() {
   panRaf = null;
   if (!panDir || renderLocation !== 'server' || !serverStatus) return;
-  const { forward, right } = cameraMoveVectors();
+  const { up, right } = cameraMoveVectors();
   const step = serverCamera.distance * 0.02;
-  for (let i = 0; i < 3; i++) serverCamera.pan[i] += (panDir.f * forward[i] + panDir.r * right[i]) * step;
+  for (let i = 0; i < 3; i++) serverCamera.pan[i] += (panDir.u * up[i] + panDir.r * right[i]) * step;
   scheduleServerRender(true);
   if (panDir) panRaf = requestAnimationFrame(panTick);
 }
