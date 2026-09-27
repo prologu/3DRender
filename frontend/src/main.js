@@ -60,6 +60,9 @@ function rotationSpeed() {
   const h = Math.max(300, els.serverViewport.clientHeight || 720);
   return (120 * Math.PI / 180) / h;
 }
+// 俯仰钳位：防止相机越过天顶/天底（±90°）。view_matrix 用固定世界 up，越过极点会使画面 180° 翻转（万向锁翻转）；
+// 钳到 ±87.1° 可几乎俯视/仰视但不越极，从根源消除上下旋转翻转。yaw 仍无界（水平 360° 自由转）。
+const PITCH_LIMIT = Math.PI / 2 - 0.05;
 function deviceLabel() {
   const name = (serverDevice || '').replace(/^NVIDIA\s+/i, '').trim();
   return name || 'GPU';
@@ -749,7 +752,7 @@ els.serverViewport.addEventListener('pointermove', (event) => {
     serverDrag = { x: event.clientX, y: event.clientY };
     const rot = rotationSpeed();
     serverCamera.yaw -= dx * rot;
-    serverCamera.pitch += dy * rot;
+    serverCamera.pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, serverCamera.pitch + dy * rot));
     syncHybridCamera();
     scheduleServerRender(true);
   }
