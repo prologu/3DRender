@@ -9,7 +9,7 @@ svg { width: 20px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-l
 #viewport.ready { opacity: 1; }
 #viewport.server-hidden { opacity: 0; pointer-events: none; }
 #viewport canvas { display: block; width: 100% !important; height: 100% !important; }
-#serverViewport { position: absolute; z-index: 2; inset: 0; display: grid; place-items: center; background: #090b0f; opacity: 0; pointer-events: none; transition: opacity .35s ease; cursor: grab; user-select: none; }
+#serverViewport { position: absolute; z-index: 2; inset: 0; display: grid; place-items: center; background: #090b0f; opacity: 0; pointer-events: none; transition: opacity .35s ease; cursor: grab; user-select: none; touch-action: none; }
 #serverViewport.active { pointer-events: auto; }
 #serverViewport.active.ready { opacity: 1; }
 #serverViewport:active { cursor: grabbing; }

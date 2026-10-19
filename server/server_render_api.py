@@ -382,7 +382,8 @@ class RendererState:
     def view_matrix(center: np.ndarray, yaw: float, pitch: float, distance: float,
                     pan=(0.0, 0.0, 0.0)) -> np.ndarray:
         center = center + np.asarray(pan, dtype=np.float32).reshape(3)
-        pitch = float(pitch)
+        yaw = math.remainder(float(yaw), math.tau)
+        pitch = math.remainder(float(pitch), math.tau)
         offset = np.array([
             math.sin(yaw) * math.cos(pitch),
             math.sin(pitch),
@@ -391,13 +392,15 @@ class RendererState:
         eye = center + offset
         forward = center - eye
         forward /= max(float(np.linalg.norm(forward)), 1e-8)
-        up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-        right = np.cross(up, forward)
-        if np.linalg.norm(right) < 1e-5:
-            up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-            right = np.cross(up, forward)
-        right /= max(float(np.linalg.norm(right)), 1e-8)
-        true_up = np.cross(forward, right)
+        # Analytic spherical-camera basis. Unlike cross(world_up, forward),
+        # this remains well-defined at both poles and is continuous as pitch
+        # passes +/-90 degrees, enabling unrestricted vertical orbiting.
+        right = np.array([math.cos(yaw), 0.0, math.sin(yaw)], dtype=np.float32)
+        true_up = np.array([
+            -math.sin(pitch) * math.sin(yaw),
+            math.cos(pitch),
+            math.sin(pitch) * math.cos(yaw),
+        ], dtype=np.float32)
         rotation = np.stack((right, -true_up, forward), axis=0)
         view = np.eye(4, dtype=np.float32)
         view[:3, :3] = rotation
@@ -413,17 +416,31 @@ class RendererState:
         yaw = float(request.get("yaw", 0.0))
         pitch = float(request.get("pitch", 0.0))
         distance = float(request.get("distance", self.metadata["camera"]["distance"]))
+        if not all(math.isfinite(value) for value in (yaw, pitch, distance)):
+            raise ValueError("相机参数必须是有限数值")
         distance = float(np.clip(distance, self.metadata["radius"] * 0.08, self.metadata["radius"] * 20.0))
-        fov = float(np.clip(float(request.get("fov", 55.0)), 20.0, 100.0))
+        fov = float(request.get("fov", 55.0))
+        if not math.isfinite(fov):
+            raise ValueError("FOV 必须是有限数值")
+        fov = float(np.clip(fov, 20.0, 100.0))
         background = request.get("background", [9 / 255, 11 / 255, 15 / 255])
         if not isinstance(background, list) or len(background) != 3:
             background = [9 / 255, 11 / 255, 15 / 255]
+        try:
+            background = [float(value) for value in background]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("背景色必须包含三个数值") from exc
+        if not all(math.isfinite(value) for value in background):
+            raise ValueError("背景色必须是有限数值")
+        background = [float(np.clip(value, 0.0, 1.0)) for value in background]
 
         center = np.asarray(self.metadata["center"], dtype=np.float32)
         try:
             pan = np.asarray(request.get("pan", [0.0, 0.0, 0.0]), dtype=np.float32).reshape(3)
         except (ValueError, TypeError):
             pan = np.zeros(3, dtype=np.float32)
+        if not np.isfinite(pan).all():
+            raise ValueError("平移参数必须是有限数值")
         pan_norm = float(np.linalg.norm(pan))
         pan_max = self.metadata["radius"] * 8.0
         if pan_norm > pan_max:
@@ -850,18 +867,43 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header("Pragma", "no-cache")
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
+        # Keep multipart framing canonical: open the first boundary now and
+        # leave the next boundary open after each JPEG. The one-shot idle
+        # repeat below handles Chromium's buffering of the final open part.
+        self.wfile.write(b"--frame\r\n")
+        self.wfile.flush()
         rendered_revision = 0
         last_image: bytes | None = None
         last_stats: dict | None = None
+        idle_repeat_sent = False
+
+        def send_frame(image: bytes, stats: dict) -> None:
+            stats_header = json.dumps(stats, separators=(",", ":"))
+            headers = (
+                "Content-Type: image/jpeg\r\n"
+                f"Content-Length: {len(image)}\r\n"
+                f"X-Render-Stats: {stats_header}\r\n\r\n"
+            ).encode("ascii")
+            self.wfile.write(headers)
+            self.wfile.write(image)
+            self.wfile.write(b"\r\n--frame\r\n")
+            self.wfile.flush()
+
         try:
             while not session.closed:
-                item = session.next_request(rendered_revision)
+                # Chromium does not present the final part of an open MJPEG
+                # response until another complete part arrives. Wake shortly
+                # after motion stops and repeat the already encoded JPEG once;
+                # this commits the visible final frame without another GPU
+                # render or continuous idle traffic.
+                item = session.next_request(rendered_revision, timeout=0.1)
                 if item is None:
                     break
                 request, revision = item
                 if revision <= rendered_revision:
-                    # 相机静止：没有新帧可发，不再重复传输旧帧（省 CPU/带宽/解码）。
-                    time.sleep(0.05)
+                    if last_image is not None and last_stats is not None and not idle_repeat_sent:
+                        send_frame(last_image, last_stats)
+                        idle_repeat_sent = True
                     continue
                 active_request = request
                 if self.app.auto_lod:
@@ -897,17 +939,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                     **last_stats, "revision": revision,
                     "lod_auto": round(session.auto_fraction, 3) if self.app.auto_lod else None,
                 }
-                stats_header = json.dumps(session.stats or {}, separators=(",", ":"))
-                headers = (
-                    "--frame\r\n"
-                    "Content-Type: image/jpeg\r\n"
-                    f"Content-Length: {len(last_image)}\r\n"
-                    f"X-Render-Stats: {stats_header}\r\n\r\n"
-                ).encode("ascii")
-                self.wfile.write(headers)
-                self.wfile.write(last_image)
-                self.wfile.write(b"\r\n")
-                self.wfile.flush()
+                send_frame(last_image, session.stats)
+                idle_repeat_sent = False
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as exc:

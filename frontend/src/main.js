@@ -55,14 +55,32 @@ let hybridPreviewGen = null;
 const USE_HYBRID_PREVIEW = false;
 let serverDevice = null;
 const serverCamera = { yaw: 0, pitch: 0, distance: 6, pan: [0, 0, 0] };
+window.__lumaServerCamera = serverCamera;
 // 视口相对旋转灵敏度：拖动整个视口高度约转 120°（可控，避免“轻微拖动大量旋转”）。
 function rotationSpeed() {
   const h = Math.max(300, els.serverViewport.clientHeight || 720);
   return (120 * Math.PI / 180) / h;
 }
-// 俯仰钳位：防止相机越过天顶/天底（±90°）。view_matrix 用固定世界 up，越过极点会使画面 180° 翻转（万向锁翻转）；
-// 钳到 ±87.1° 可几乎俯视/仰视但不越极，从根源消除上下旋转翻转。yaw 仍无界（水平 360° 自由转）。
-const PITCH_LIMIT = Math.PI / 2 - 0.05;
+const TWO_PI = Math.PI * 2;
+function wrapAngle(angle) {
+  return ((angle + Math.PI) % TWO_PI + TWO_PI) % TWO_PI - Math.PI;
+}
+
+// 连续球面相机基。right 不再由 cross(worldUp, forward) 求得，因此经过
+// 天顶/天底时不会退化，也不需要限制 pitch。up 会自然连续翻转，让完整的
+// 纵向 360° 轨道旋转保持方向连续。
+function cameraBasis(yaw, pitch) {
+  const sinYaw = Math.sin(yaw);
+  const cosYaw = Math.cos(yaw);
+  const sinPitch = Math.sin(pitch);
+  const cosPitch = Math.cos(pitch);
+  return {
+    forward: [-sinYaw * cosPitch, -sinPitch, cosYaw * cosPitch],
+    right: [cosYaw, 0, sinYaw],
+    up: [-sinPitch * sinYaw, cosPitch, sinPitch * cosYaw]
+  };
+}
+window.__lumaCameraBasis = cameraBasis;
 function deviceLabel() {
   const name = (serverDevice || '').replace(/^NVIDIA\s+/i, '').trim();
   return name || 'GPU';
@@ -360,14 +378,17 @@ async function disposeHybridPreview() {
 function syncHybridCamera() {
   if (!hybridViewer || !serverStatus) return;
   const center = serverStatus.center || [0, 0, 0];
-  const { yaw, pitch, distance } = serverCamera;
+  const { yaw, pitch, distance, pan } = serverCamera;
+  const target = center.map((value, index) => value + (pan?.[index] || 0));
   const offset = [
     Math.sin(yaw) * Math.cos(pitch) * distance,
     Math.sin(pitch) * distance,
     -Math.cos(yaw) * Math.cos(pitch) * distance
   ];
-  hybridViewer.camera.position.set(center[0] + offset[0], center[1] + offset[1], center[2] + offset[2]);
-  hybridViewer.controls.target.set(center[0], center[1], center[2]);
+  const { up } = cameraBasis(yaw, pitch);
+  hybridViewer.camera.position.set(target[0] + offset[0], target[1] + offset[1], target[2] + offset[2]);
+  hybridViewer.camera.up.set(up[0], up[1], up[2]);
+  hybridViewer.controls.target.set(target[0], target[1], target[2]);
   hybridViewer.camera.lookAt(hybridViewer.controls.target);
   hybridViewer.controls.update();
 }
@@ -734,48 +755,50 @@ window.addEventListener('drop', (event) => { event.preventDefault(); dragDepth =
 
 els.serverViewport.addEventListener('pointerdown', (event) => {
   if (renderLocation !== 'server' || !serverStatus) return;
+  if (event.button !== 0 && event.button !== 2) return;
   els.serverViewport.setPointerCapture(event.pointerId);
   if (event.button === 2) {
     // 右键：屏幕平面平移（与左键旋转区分）
-    serverPanDrag = { x: event.clientX, y: event.clientY };
+    serverPanDrag = { x: event.clientX, y: event.clientY, pointerId: event.pointerId };
   } else {
     // 左键：旋转
-    serverDrag = { x: event.clientX, y: event.clientY };
+    serverDrag = { x: event.clientX, y: event.clientY, pointerId: event.pointerId };
     if (hybridViewer) { setHybridVisible(true); syncHybridCamera(); }
   }
 });
 els.serverViewport.addEventListener('pointermove', (event) => {
   if (renderLocation !== 'server') return;
-  if (serverDrag) {
+  if (serverDrag && serverDrag.pointerId === event.pointerId) {
     const dx = event.clientX - serverDrag.x;
     const dy = event.clientY - serverDrag.y;
-    serverDrag = { x: event.clientX, y: event.clientY };
+    serverDrag = { x: event.clientX, y: event.clientY, pointerId: event.pointerId };
     const rot = rotationSpeed();
-    serverCamera.yaw -= dx * rot;
-    serverCamera.pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, serverCamera.pitch + dy * rot));
+    serverCamera.yaw = wrapAngle(serverCamera.yaw - dx * rot);
+    serverCamera.pitch = wrapAngle(serverCamera.pitch + dy * rot);
     syncHybridCamera();
     scheduleServerRender(true);
   }
-  if (serverPanDrag) {
+  if (serverPanDrag && serverPanDrag.pointerId === event.pointerId) {
     const dx = event.clientX - serverPanDrag.x;
     const dy = event.clientY - serverPanDrag.y;
-    serverPanDrag = { x: event.clientX, y: event.clientY };
+    serverPanDrag = { x: event.clientX, y: event.clientY, pointerId: event.pointerId };
     const { right, up } = cameraMoveVectors();
     const scale = (serverCamera.distance / Math.max(els.serverViewport.clientHeight || 720, 300)) * 0.6;
     for (let i = 0; i < 3; i++) serverCamera.pan[i] += (-right[i] * dx + up[i] * dy) * scale;
     scheduleServerRender(true);
   }
 });
-els.serverViewport.addEventListener('pointerup', () => {
-  const wasActive = serverDrag || serverPanDrag;
-  serverDrag = null; serverPanDrag = null;
+function finishServerPointer(event) {
+  const rotating = serverDrag?.pointerId === event.pointerId;
+  const panning = serverPanDrag?.pointerId === event.pointerId;
+  const wasActive = rotating || panning;
+  if (rotating) serverDrag = null;
+  if (panning) serverPanDrag = null;
   if (wasActive) scheduleServerRender(false);
-});
-els.serverViewport.addEventListener('pointercancel', () => {
-  const wasActive = serverDrag || serverPanDrag;
-  serverDrag = null; serverPanDrag = null;
-  if (wasActive) scheduleServerRender(false);
-});
+}
+els.serverViewport.addEventListener('pointerup', finishServerPointer);
+els.serverViewport.addEventListener('pointercancel', finishServerPointer);
+els.serverViewport.addEventListener('lostpointercapture', finishServerPointer);
 els.serverViewport.addEventListener('contextmenu', (event) => { if (renderLocation === 'server') event.preventDefault(); });
 els.serverViewport.addEventListener('wheel', (event) => {
   if (renderLocation !== 'server' || !serverStatus) return;
@@ -793,20 +816,10 @@ let activePanDirs = new Set();
 let panRaf = null;
 // 屏幕平面方向：up/down=屏幕上/下，left/right=屏幕左/右（始终与画面一致，不反向）
 const navDirVectors = { up: { u: 1, r: 0 }, down: { u: -1, r: 0 }, left: { u: 0, r: -1 }, right: { u: 0, r: 1 } };
-// 相机屏幕轴（世界系），与服务端 view_matrix 一致：right=cross(worldUp,forward)、up=cross(forward,right)
+// 相机屏幕轴（世界系），与服务端的连续解析相机基一致。
 function cameraMoveVectors() {
   const { yaw, pitch } = serverCamera;
-  const forward = [-Math.sin(yaw) * Math.cos(pitch), -Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch)];
-  let right = [forward[2], 0, -forward[0]]; // cross(worldUp=(0,1,0), forward)
-  const rn = Math.hypot(right[0], right[2]);
-  right = rn < 1e-4 ? [1, 0, 0] : [right[0] / rn, 0, right[2] / rn];
-  const up = [ // cross(forward, right) = 屏幕上
-    forward[1] * right[2] - forward[2] * right[1],
-    forward[2] * right[0] - forward[0] * right[2],
-    forward[0] * right[1] - forward[1] * right[0]
-  ];
-  const un = Math.hypot(up[0], up[1], up[2]) || 1;
-  return { forward, right, up: [up[0] / un, up[1] / un, up[2] / un] };
+  return cameraBasis(yaw, pitch);
 }
 function recomputePanDir() {
   if (!activePanDirs.size) { panDir = null; return; }
