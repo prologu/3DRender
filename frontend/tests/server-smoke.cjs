@@ -14,11 +14,21 @@ const path = require('node:path');
     await page.addInitScript((value) => { window.LUMA_RENDER_API = value; }, renderApi);
   }
   const errors = [];
+  let websocketConnections = 0;
+  let websocketFrames = 0;
   page.on('console', message => { if (message.type() === 'error') errors.push(`console: ${message.text()}`); });
   page.on('pageerror', error => errors.push(`page: ${error.message}`));
+  page.on('websocket', socket => {
+    websocketConnections++;
+    socket.on('framereceived', () => { websocketFrames++; });
+  });
   await page.goto(baseUrl, { waitUntil: 'networkidle' });
   await page.locator('#serverMode').click();
-  await page.waitForFunction(() => document.querySelector('#serverFrame').naturalWidth > 0, null, { timeout: 30000 });
+  await page.waitForFunction(() => {
+    const image = document.querySelector('#serverFrame');
+    const canvas = document.querySelector('#serverCanvas');
+    return image.naturalWidth > 0 || canvas.width > 0;
+  }, null, { timeout: 30000 });
 
   const before = await page.locator('#serverMetrics').textContent();
   const box = await page.locator('#serverViewport').boundingBox();
@@ -57,25 +67,35 @@ const path = require('node:path');
   await page.selectOption('#qualitySelect', 'performance');
   await page.waitForFunction(() => {
     const frame = document.querySelector('#serverFrame');
-    return document.querySelector('#serverMetrics').textContent.includes('800×450') && frame.naturalWidth === 800;
+    const canvas = document.querySelector('#serverCanvas');
+    return document.querySelector('#serverMetrics').textContent.includes('800×450') &&
+      (frame.naturalWidth === 800 || canvas.width === 800);
   }, null, { timeout: 30000 });
   await page.screenshot({ path: path.resolve('tests/server-viewer.png'), fullPage: true });
 
-  const result = await page.evaluate(() => ({
-    file: document.querySelector('#fileName').textContent,
-    splats: document.querySelector('#splatCount').textContent,
-    backend: document.querySelector('#backendLabel').textContent,
-    badge: document.querySelector('#webglBadge').textContent.trim(),
-    metrics: document.querySelector('#serverMetrics').textContent,
-    streaming: document.querySelector('#serverFrame').src.includes('/api/session/'),
-    pitchAfterPole: window.__lumaServerCamera.pitch,
-    width: document.querySelector('#serverFrame').naturalWidth,
-    height: document.querySelector('#serverFrame').naturalHeight
-  }));
+  const result = await page.evaluate(() => {
+    const frame = document.querySelector('#serverFrame');
+    const canvas = document.querySelector('#serverCanvas');
+    return {
+      file: document.querySelector('#fileName').textContent,
+      splats: document.querySelector('#splatCount').textContent,
+      backend: document.querySelector('#backendLabel').textContent,
+      badge: document.querySelector('#webglBadge').textContent.trim(),
+      metrics: document.querySelector('#serverMetrics').textContent,
+      transport: document.querySelector('#serverViewport').classList.contains('websocket') ? 'websocket' : 'mjpeg',
+      pitchAfterPole: window.__lumaServerCamera.pitch,
+      width: canvas.width || frame.naturalWidth,
+      height: canvas.height || frame.naturalHeight
+    };
+  });
+  result.websocketConnections = websocketConnections;
+  result.websocketFrames = websocketFrames;
   result.errors = errors;
   console.log(JSON.stringify(result, null, 2));
   await browser.close();
-  if ((expectedModel && result.file !== expectedModel) || result.splats === '—' || result.width !== 800 || result.height !== 450 || errors.length) process.exit(1);
+  if ((expectedModel && result.file !== expectedModel) || result.splats === '—' ||
+      result.width !== 800 || result.height !== 450 || result.transport !== 'websocket' ||
+      websocketConnections < 1 || websocketFrames < 1 || errors.length) process.exit(1);
 })().catch(error => {
   console.error(error);
   process.exit(1);

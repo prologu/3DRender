@@ -10,7 +10,7 @@ flowchart LR
     S --> C["latest-camera 合并"]
     C --> G["gsplat / CUDA"]
     G --> J["Pillow JPEG 编码"]
-    J -->|"MJPEG 长连接"| UI
+    J -->|"WebSocket JPEG（首选） / MJPEG（降级）"| UI
     UI -->|"PLY 分块上传"| P["磁盘文件 + 校验"]
     P --> M["CPU 解析 / 稳定 LOD 排序"]
     M --> G
@@ -20,17 +20,19 @@ flowchart LR
 
 ## 服务端帧流
 
-客户端创建 `/api/session` 后，用一个 `multipart/x-mixed-replace` 长连接接收 JPEG。相机更新只写入该会话的最新状态，不为每个鼠标事件排一个完整渲染任务。流线程取走状态时记录 revision；渲染期间到达的多个更新会被合并为下一次最新状态。
+客户端创建 `/api/session` 后优先升级到双向 WebSocket：文本消息发送相机状态，二进制消息接收 `stats + JPEG`。相机消息带递增 `client_seq`，服务端随渲染帧确认；浏览器最多保留 2 个未确认视角，待发状态始终覆盖为最新值。这样既避免逐请求 RTT，又避免有序 TCP 中积压过期视角。WebSocket 不可用时回退到 `multipart/x-mixed-replace` MJPEG，并通过 POST 更新相机。
 
-会话空闲时不主动渲染，仅每 15 秒重发上一帧维持连接。默认最多 4 个会话、120 秒无流连接自动回收。GPU 光栅化通过进程内锁串行化，JPEG 编码位于锁外，因此其他请求可在 CPU 编码期间使用 GPU。
+两种协议都只渲染新 revision。MJPEG 在停止后仅补发一次已编码帧以提交 Chromium 缓冲，并探测空闲 socket 断开；WebSocket 不需要重复帧。默认最多 4 个会话、120 秒无流连接自动回收。各渲染调用从 CUDA stream 池取独立 stream，只有模型加载/更换持有全局互斥。
 
 ## 当前 LOD
 
 模型加载时使用 `opacity × max(scale)²` 作为与视角无关的重要性近似，只排序一次。三个 LOD 是同一数组的稳定前缀：
 
-- `preview`：25%，交互时配合 640×360、JPEG quality 72。
+- `preview`：25%，性能交互档使用 640×360、JPEG quality 68。
 - `balanced`：55%，性能模式静止帧使用 800×450。
 - `full`：100%，高清模式静止帧使用 1280×720。
+
+高清交互档使用 800×450、JPEG quality 74、最多 35% 点；性能交互档最多 25% 点。停止 140 ms 后恢复用户选择的分辨率、JPEG 质量和 LOD。
 
 稳定前缀避免 LOD 切换时随机闪烁，也避免每帧生成 GPU 索引数组。它能减少光栅工作集和传输带宽，但不会减少完整模型的常驻显存，这是它与空间流式 LOD 的关键区别。
 
@@ -58,6 +60,7 @@ flowchart LR
 | POST | `/api/model` | 原始请求体上传标准 PLY |
 | POST | `/api/render` | 单次 JPEG 渲染，兼容与高清截图 |
 | POST | `/api/session` | 创建交互会话并提交初始相机 |
+| GET | `/api/session/{id}/ws` | 双向 WebSocket 相机控制与 JPEG 帧流 |
 | POST | `/api/session/{id}/camera` | 更新最新相机、分辨率和 LOD |
 | GET | `/api/session/{id}/stream` | MJPEG 帧流 |
 | GET | `/api/session/{id}` | 最近一帧指标 |

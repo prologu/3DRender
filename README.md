@@ -7,7 +7,9 @@
 | 浏览器本地渲染 | 用户浏览器 / WebGL 2 | `.ply`、`.splat`、`.ksplat`、`.spz` | 快速查看、无需后端、文件不上传 |
 | GPU 服务端渲染 | Linux + NVIDIA GPU + gsplat | 标准 binary little-endian 3DGS `.ply` | 低配置客户端、大模型、统一算力 |
 
-服务端模式包含 MJPEG 长连接、相机状态合并（latest-camera-wins）与 LOD 控制：客户端档位（preview / balanced / full）或数值点数比例设点数上限、服务端帧预算按 `FRAME_BUDGET_MS` 自动升降比例（高配卡跑全量点、弱卡自动降档保帧率），空间 LOD 为可选实验项（默认关闭）。交互（拖动）按当前质量档同分辨率渲染（默认 1280×720，不再低清发糊），旋转灵敏度改为视口相对（拖满视口高约转 120°，避免“轻微拖动大量旋转”/卡手）。`yaw` 与 `pitch` 均支持连续 360° 轨道旋转；前后端使用在天顶/天底仍良定义的解析相机基，不再用俯仰钳位规避极点。**旋转与移动明确区分**：**左键拖动 = 旋转**（orbit）、**右键拖动 = 移动**（屏幕平面平移）、**滚轮 = 缩放**。前后左右移动：页面左下导航盘（↑↓←→ + 中心停止）按住沿**屏幕轴**（画面上下左右）移动视角，`WASD`/方向键等效，步长随缩放缩放、服务端按模型半径截断；屏幕轴与服务端 `view_matrix` 完全一致，移动方向始终与画面朝向一致、不反向。高斯加载量滑杆（面板“高斯加载量”，10%–100%，即“置信度”）实时选择服务端加载点数比例，服务端自适应 LOD 仍会在超帧预算时自动降档兜底（为 MatrixCity 级大场景准备的效率手段；完整模型常驻 GPU 的显存硬上限与 out-of-core 路线见 [大规模场景路线](docs/LARGE_SCENES.md)）。多个交互会话在独立 CUDA stream 上并发渲染，互不串行；相机静止后仅补发一次已编码帧，以兼容 Chromium 的 MJPEG 最后一段缓冲行为，不会重复进行 GPU 渲染或持续发送。客户端混合渲染（拖动时本地粗模即时预览）默认关闭，需要时 `USE_HYBRID_PREVIEW=true` 启用。
+服务端模式优先使用**单条双向 WebSocket**：同一连接上传相机状态、下传统计信息和 JPEG 帧；浏览器不支持或代理阻断 WebSocket 时自动回退 MJPEG。相机状态采用 latest-camera-wins，并以 `client_seq` 帧确认把未确认视角限制为 2 个，慢链路也不会让过期鼠标事件排成长队。拖动时使用 640×360（性能）或 800×450（高清）的交互档、较低 JPEG 质量和 25%/35% LOD 上限；停止 140 ms 后恢复用户选择的分辨率、质量和点数，兼顾响应与最终清晰度。服务端继续按 `FRAME_BUDGET_MS` 自动调节 LOD，空间 LOD 为可选实验项（默认关闭）。
+
+`yaw` 与 `pitch` 均支持连续 360° 轨道旋转；前后端使用在天顶/天底仍良定义的解析相机基。**左键拖动 = 旋转**、**右键拖动 = 屏幕平面移动**、**滚轮 = 缩放**；导航盘和 `WASD`/方向键也沿屏幕轴移动。高斯加载量滑杆实时设置点数比例上限，完整模型常驻 GPU 的硬上限与 out-of-core 路线见 [大规模场景路线](docs/LARGE_SCENES.md)。多个会话使用独立 CUDA stream；客户端混合粗模预览默认关闭，需要时用 `USE_HYBRID_PREVIEW=true` 开启。
 
 ## 目录
 
@@ -19,7 +21,7 @@
 │  ├─ tests/                      # 浏览器冒烟测试
 │  └─ deploy/run-viewer.sh        # 静态站点启动脚本
 ├─ server/                        # PyTorch + CUDA + gsplat 服务端
-│  ├─ server_render_api.py        # HTTP / MJPEG 渲染 API
+│  ├─ server_render_api.py        # HTTP / WebSocket / MJPEG 渲染 API
 │  ├─ setup.sh                    # 在线或离线安装隔离依赖
 │  ├─ download-wheels.sh          # Linux 下载离线依赖包
 │  ├─ download-wheels.ps1         # Windows 下载 Linux 离线依赖包
@@ -188,7 +190,7 @@ bash ./run-render-server.sh
 | `AUTO_LOD` | `true` | 启用服务端自适应 LOD；`false` 时严格使用客户端请求的档位 |
 | `LUMA_PYTHON` | `python3` | 启动使用的 Python 解释器（隔离部署指向 conda 环境路径） |
 | `LUMA_JPEG_BACKEND` | `pillow` | JPEG 编码后端，可设 `opencv`（需装 opencv-python-headless） |
-| `SPATIAL_LOD` | `true` | 启用空间 LOD（按视锥 + 屏幕空间误差选叶节点）；`false` 时 LOD 只按重要性前缀截取 |
+| `SPATIAL_LOD` | `false` | 启用实验性空间 LOD（按视锥 + 屏幕空间误差选叶节点）；`false` 时 LOD 只按重要性前缀截取 |
 | `UPLOAD_DIR` | `server/uploads` | 上传文件保存目录 |
 
 显存比例不是模型容量保证。应根据模型 Gaussian 数、分辨率和同卡已有任务保守调整；脚本不会自动结束其他进程。
@@ -200,7 +202,7 @@ curl http://127.0.0.1:8090/health
 curl http://127.0.0.1:8090/api/status
 ```
 
-主要接口：`POST /api/model`、`POST /api/render`、`POST /api/session`、`POST /api/session/{id}/camera`、`GET /api/session/{id}/stream`、`GET /api/model.splat?frac=0.25`（导出粗模预览）。请求细节见 [技术架构](docs/ARCHITECTURE.md)。
+主要接口：`POST /api/model`、`POST /api/render`、`POST /api/session`、`GET /api/session/{id}/ws`（首选双向帧流）、`POST /api/session/{id}/camera` + `GET /api/session/{id}/stream`（MJPEG 兼容路径）、`GET /api/model.splat?frac=0.25`。请求细节见 [技术架构](docs/ARCHITECTURE.md)。
 
 ### 性能优化（服务端帧流水线）
 
@@ -208,38 +210,39 @@ curl http://127.0.0.1:8090/api/status
 
 | 优化 | 行为 | 实测数据 |
 | --- | --- | --- |
+| WebSocket 双向低延迟流 | 相机 JSON 与 JPEG 帧复用一条持久连接；二进制帧为 `4-byte stats 长度 + stats JSON + JPEG`。客户端仅保留最新待发视角、最多 2 个未确认序号，并在解码拥塞时只绘制最新帧 | A5000、2,146,592 点：Tailscale 直连交互中位显示间隔 27.2 ms（约 36.8 FPS），松手后 800×450 / full 最终帧 43.3 ms；SSH 隧道分别约 32 ms 与 110 ms。旧的逐次 POST 控制链路约 3.3 FPS、帧间隔中位约 250 ms |
+| 交互/静止双档 | 拖动时降低分辨率、JPEG 质量和 LOD 上限；停止 140 ms 后恢复用户选择。GPU 快时可以连续出帧，网络慢时仍由序号背压丢弃旧视角 | 同一 2.146M 点模型：交互预览渲染通常 8–14 ms；800×450 full 最终帧约 29–42 ms。全量 1280×720 通常 40–70 ms，因此不能承诺 full 档稳定 60 FPS |
 | 服务端自适应 LOD | 帧耗时超过 `FRAME_BUDGET_MS` 时按比例自动降 LOD，客户端档位为上限，有余量每帧最多回升 15%；新会话前 3 帧跳过调整 | 3 ms 强制预算：full 11.9 ms → 25%（8.5 ms）→ 9%（6.8 ms）→ 5% 地板（稳定 5.5 ms）；默认 33 ms 预算下 full 档 9.7 ms 不变档 |
 | 空闲帧提交 | 相机静止 100 ms 后仅补发一次已编码 JPEG，促使 Chromium 提交首帧/最终帧；不重新调用 GPU 渲染，也不持续传输 | 浏览器静止首帧可见；之后保持空闲，无连续重传 |
 | 多会话 CUDA stream 并发 | 移除渲染路径全局锁，每个渲染调用从流池取独立 `torch.cuda.Stream`（池大小 = 会话上限），仅模型加载保留互斥 | 相机 50ms 更新下：单会话 19.6 fps，双会话各 19.3 fps，四会话各 18.9 fps（与单会话持平，无头程阻塞） |
 | LOD 选点策略（重要性前缀为默认） | 默认按 `不透明度 × 最大尺度²` 的重要性前缀截取（每个 LOD 都是同一组张量的稳定前缀，质量切换不重排、不建索引缓冲）。实测该模型所有高斯尺度几乎均匀（max_scale≈0.009），重要性≈不透明度，top-N 前缀天然把表面铺满、无可见空洞；空间叶选择（`--spatial-lod`，近处贪心）对这类表面模型会饿死远处覆盖（2.35% 洞），故降为实验项默认关闭 | 25% 预算（960×540）：前缀 290K 点，渲染 8.8 ms（≤33 ms 预算）；恢复后 25% 帧与旧版前缀帧逐像素一致（diff 0.00%），可见像素覆盖率 10.27% |
 | 任意方向连续 360° 旋转 | `yaw`、`pitch` 仅做周期归一化，不做俯仰钳位；前后端统一使用解析 `forward/right/up` 基，`right` 不再由 `cross(worldUp, forward)` 求得，因此经过 ±90° 两个极点时不退化、不跳变 | A5000 浏览器实测 2,146,592 点：拖动后 `pitch=1.759 rad`（约 100.8°，已越过旧 ±87° 限制），三个基向量长度均为 1、两两点积约 0；服务端单元测试覆盖两个极点、完整 2π 周期和超大角度 |
-| 全质量交互渲染（自适应 LOD 平衡） | 交互（拖动）不再写死 25% 点数上限，改为跟随质量选择器（默认 full）；服务端自适应 LOD 在帧预算内自动平衡——高配卡跑全量点、弱卡自动降档保帧率 | A5000 连续交互下持续全质量：1,160,393 点，render_ms 中位 18.3 ms（p95 25.2 ms），远在 33 ms 预算内；空洞/“点被移除/团块”观感消除 |
+| 自适应 LOD 平衡 | 交互档先给出可预测的响应上限，服务端再在客户端 LOD 上限内按帧预算自动调节；静止 settle 帧恢复用户请求的点数 | 避免大模型拖动时全量帧阻塞；高配卡在静止后仍显示 full，弱卡超预算时不会强行升档振荡 |
 | 客户端混合渲染（默认关闭） | 服务端导出 25% 粗模（`GET /api/model.splat`，32 字节/点），前端叠加画布本地渲染以提供拖动即时反馈。因服务端已可在帧预算内渲染全量点，叠加层只渲染 25% 稀疏点反而产生空洞，故默认关闭（`USE_HYBRID_PREVIEW`，置 true 重新启用） | 默认下拖动直接显示全质量服务端帧（1,160,393 点、15-19 ms）；需要本地即时反馈时开启叠加层（9.3 MB 粗模下载一次） |
-| 交互手感 + 前后左右移动 + 高斯加载量滑杆 | ① 交互帧不再写死 640×360 低清，改与静止同分辨率（默认 1280×720），消除拖动发糊；② 旋转灵敏度由固定 `0.008 rad/px`（≈全屏高转 360°，导致“轻微拖动大量旋转”/卡手）改为视口相对（拖满视口高约 120°）；③ 新增相机 pan：左下导航盘（↑↓←→ + 中心停止）按住沿相机本地方向平移，`WASD`/方向键等效，步长 `distance×0.02` 随缩放缩放，服务端按模型半径×8 截断；④ 面板新增“高斯加载量”滑杆（10%–100%），数值 `lod` 直接下发服务端选择点数比例 | A5000 实测（1,160,393 点）：交互帧 1280×720 连续 render_ms 中位 18.3 ms（预算内不降档）；pan 按住右/左分别 +X/-X、W/S 分别 +Z/-Z（方向经浏览器抓包核对）；滑杆 100%→50% 点数 1,160,393→580,196、显存 218→147 MiB、render_ms 27.5→21.7 ms；滑杆 + 自适应 LOD 双保险，弱卡/大场景满加载时自动降档保帧率 |
+| 交互手感 + 前后左右移动 + 高斯加载量滑杆 | ① 拖动使用独立交互档，停止后自动细化；② 旋转灵敏度按视口尺寸计算（拖满视口高约转 120°）；③ 导航盘和键盘沿相机屏幕轴累计 `pan`，步长随距离缩放；④ 10%–100% 滑杆直接设置点数比例上限 | 滑杆与自适应 LOD 构成双保险；旋转、移动、缩放三种操作互不混淆，跨极点移动方向保持一致 |
 | 旋转与移动区分 + 上下反向修复 | ① **左键拖动 = 旋转、右键拖动 = 移动（屏幕平面平移）、滚轮 = 缩放**——鼠标键位明确区分旋转与移动（右键菜单已屏蔽）；② 导航盘（↑↓←→ + 中心停止）与 `WASD`/方向键使用**屏幕轴**（画面上/下/左/右），并与服务端共享同一组连续解析相机基，因此越过天顶/天底后移动方向仍与画面一致；③ `pointercancel` 与 `lostpointercapture` 均会结束拖动，避免鼠标移出窗口后产生“卡住”状态 | 浏览器测试核对：左键拖仅改变 yaw/pitch，右键拖仅改变 pan；越过旧俯仰限制后相机基仍保持正交，导航方向无极点退化 |
 
-未实现项见 [大规模场景路线](docs/LARGE_SCENES.md)：out-of-core 分块流式加载、深度排序缓存、WebRTC 低延迟传输。
+未实现项见 [大规模场景路线](docs/LARGE_SCENES.md)：out-of-core 分块流式加载、深度排序缓存、WebRTC/H.264 多用户视频传输。当前 WebSocket 传 JPEG 已解决控制排队，但不是视频编码器，公网高并发仍建议 WebRTC。
 
 ## 4. 前后端联调与访问
 
 浏览器页面右上角可切换“本地渲染 / 服务端渲染”。本地渲染时模型不离开设备；切换到服务端后，标准 PLY 才会上传到 API。
 
-当前测试端口约定：
+推荐的 A5000 单端口部署：
 
-- 静态查看器：容器内 `8088`
-- GPU 渲染 API：容器内 `8090`
-- SSH 转发后的本机地址：`18088` 和 `18090`
+- 页面、API、WebSocket 和 MJPEG：服务器 `8089`
+- Tailscale 直连：`http://100.64.0.60:8089/`
+- SSH 转发后的本机地址：`http://127.0.0.1:18089/`
 
-Docker 容器没有发布端口时无需删除或重建容器。在用户设备建立 SSH 隧道：
+能访问 Tailscale 地址时优先直连，可少一层 SSH 转发。若端口不可直达，在用户设备建立单端口隧道；无需删除或重建 Docker：
 
 ```bash
-ssh -N \
-  -L 18088:127.0.0.1:8088 \
-  -L 18090:127.0.0.1:8090 \
-  V100-tailscale-ljq
+ssh -N -L 18089:127.0.0.1:8089 A5000-tailscale-ljq
 ```
 
-没有 SSH config 时：
+随后打开 `http://127.0.0.1:18089/`。一个端口已经足够，因为 `server_render_api.py --site-dir ...` 同时提供静态页面、REST API 和 WebSocket Upgrade。只有把 Vite 静态站点与 GPU API 分开运行时才需要两个端口；跨域部署还需正确代理 `/api/session/*/ws` 的 Upgrade 头。
+
+旧 V100 容器若仍采用前端 `8088`、API `8090` 的分离部署，可继续使用双端口转发：
 
 ```bash
 ssh -N -p 2223 \
@@ -248,15 +251,18 @@ ssh -N -p 2223 \
   root@100.64.0.24
 ```
 
-随后访问 `http://127.0.0.1:18088`。页面在 `18088` 运行时会自动连接 `18090`；常规部署会连接同一主机的 `8090`。生产环境应通过同域名 HTTPS 反向代理两个服务，并增加鉴权、限流和上传审计。
+生产环境应使用同域名 HTTPS/WSS，并增加鉴权、限流和上传审计。
 
 ### 人工启动 / 停止命令
 
 一键命令（A5000 部署，`/home/ljq/luma/run.sh` 为部署环境自带，不在仓库内；可从任意已配置 SSH 的机器直接粘贴执行）：
 
 ```bash
-# 启动（预载测试模型，后台常驻，端口 8089）
-ssh A5000-tailscale-ljq 'cd /home/ljq/luma && MODEL_PATH=/home/ljq/luma/luma-stream-render-v2/uploads/4d3df23bcf5a48f88c83cd6a3ed02b24-rgb_rawlight_gaussian_gt_fixed.ply bash run.sh start'
+# 启动空查看器（不预载模型，网页中再上传，后台常驻，端口 8089）
+ssh A5000-tailscale-ljq 'cd /home/ljq/luma && bash run.sh start'
+
+# 可选：确实需要启动即加载时，才显式指定模型
+ssh A5000-tailscale-ljq 'cd /home/ljq/luma && MODEL_PATH=/absolute/path/model.ply bash run.sh start'
 
 # 停止 / 查看状态
 ssh A5000-tailscale-ljq 'bash /home/ljq/luma/run.sh stop'
@@ -275,7 +281,7 @@ PORT=8089 \
 setsid env PHYSICAL_GPU=0 bash run-web-renderer.sh > logs/server.log 2>&1 &
 ```
 
-`MEMORY_FRACTION` 是显存占比上限：24G 卡取 `0.25` ≈ 6 GiB，可常驻约 50M 点；共享卡请降回 `0.045`。端口被占时启动器自动跳过，不会杀其他进程；停止用 `pkill -f "[s]erver_render_api.*8089"`。
+`MEMORY_FRACTION` 是显存占比上限：24G 卡取 `0.25` ≈ 6 GiB，可常驻约 50M SH0 点；共享卡请降回 `0.045`。端口被占时启动器会拒绝启动，不会杀其他进程。优先使用 `run.sh stop` 按 PID 文件校验并停止，不要用宽泛的 `pkill`。
 
 
 ## 5. 模型要求与异常 PLY 修复
@@ -316,6 +322,8 @@ VIEWER_URL=http://127.0.0.1:18088 \
 RENDER_API=http://127.0.0.1:18090 \
 EXPECTED_MODEL=model.ply \
 npm run test:server
+npm run test:stream    # 快速拖动、背压、松手最终帧延迟
+npm run test:mjpeg     # 禁用 WebSocket 后验证自动降级与会话释放
 ```
 
 服务端显存探针默认只使用指定 GPU，并在显存余量或利用率不安全时停止增加规模：
@@ -332,6 +340,7 @@ PHYSICAL_GPU=3 bash ./run-probe.sh
 - `CUDA 不可用`：检查 `nvidia-smi`、驱动兼容性以及是否正确设置 `PHYSICAL_GPU`。
 - `GPU 剩余显存不足`：换到空闲 GPU、降低模型/分辨率，或等待已有任务结束；不要直接提高上限并挤占其他任务。
 - 页面能开但服务端模式离线：检查 `8090/18090` 转发、`/health`、浏览器控制台和 HTTPS 混合内容。
+- 页面可用但拖动卡顿：先看指标中的 `render_ms`。它很低但显示帧间隔很大，通常是 RTT、代理未升级 WebSocket 或 JPEG 带宽问题，不是显存不足；确认页面元素 `#serverViewport` 使用 `websocket` 类，并优先直连 Tailscale 单端口。
 - PLY 一加载就 OOM：先检查 NaN/Inf、`scale_*` 和 `opacity` 的保存语义，再考虑模型规模。
 - `.splat/.ksplat/.spz` 无法上传到服务端：这些格式目前仅由浏览器本地模式支持，服务端需先转换为标准 PLY。
 

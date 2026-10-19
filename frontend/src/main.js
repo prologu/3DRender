@@ -13,7 +13,7 @@ const els = {
   fullscreen: $('#fullscreen'), backgroundSelect: $('#backgroundSelect'), qualitySelect: $('#qualitySelect'),
   dragOverlay: $('#dragOverlay'), toast: $('#toast'), webglBadge: $('#webglBadge'),
   clientMode: $('#clientMode'), serverMode: $('#serverMode'), serverViewport: $('#serverViewport'),
-  serverFrame: $('#serverFrame'), serverMetrics: $('#serverMetrics'), welcomeDescription: $('#welcomeDescription'),
+  serverFrame: $('#serverFrame'), serverCanvas: $('#serverCanvas'), serverMetrics: $('#serverMetrics'), welcomeDescription: $('#welcomeDescription'),
   dropTitle: $('#dropTitle'), dropSubtitle: $('#dropSubtitle'), backendLabel: $('#backendLabel'),
   renderModeLabel: $('#renderModeLabel'), privacyTitle: $('#privacyTitle'), privacyText: $('#privacyText'),
   lodSlider: $('#lodSlider'), lodValue: $('#lodValue'), navPad: $('#navPad')
@@ -40,8 +40,16 @@ let serverRequestRunning = false;
 let serverRequestPending = false;
 let serverSession = null;
 let serverSupportsStream = false;
+let serverSupportsWebSocket = false;
 let serverUpdateRunning = false;
 let serverUpdatePending = null;
+let serverSocket = null;
+let serverSocketPending = null;
+let serverSocketRaf = null;
+let serverSocketSentSeq = 0;
+let serverSocketAckSeq = 0;
+let serverFrameDecoding = false;
+let serverFramePending = null;
 let serverSettleTimer = null;
 let serverMetricsTimer = null;
 let streamedFrames = 0;
@@ -86,6 +94,7 @@ function deviceLabel() {
   return name || 'GPU';
 }
 const API_BASE = window.LUMA_RENDER_API || window.location.origin;
+const WEBSOCKET_OPEN = 1;
 
 function hasWebGL2() {
   const canvas = document.createElement('canvas');
@@ -134,13 +143,19 @@ function lodFraction() {
 
 function serverRenderPayload(interactive = false) {
   const performanceMode = els.qualitySelect.value === 'performance';
+  const resolution = interactive
+    ? (performanceMode ? { width: 640, height: 360 } : { width: 800, height: 450 })
+    : serverResolution();
+  const requestedLod = lodFraction();
   return {
     ...serverCamera,           // 含 yaw/pitch/distance/pan
-    ...serverResolution(),     // 交互与静止同分辨率，避免拖动时低清发糊
+    ...resolution,
     background: backgroundRgb(),
     fov: 55,
-    lod: lodFraction(),
-    jpeg_quality: performanceMode ? 82 : 90
+    // 交互时优先保证连续反馈；停止 140 ms 后自动恢复用户选择的分辨率和点数。
+    lod: interactive ? Math.min(requestedLod, performanceMode ? 0.25 : 0.35) : requestedLod,
+    jpeg_quality: interactive ? (performanceMode ? 68 : 74) : (performanceMode ? 82 : 90),
+    interactive
   };
 }
 
@@ -219,6 +234,7 @@ async function connectServer() {
     if (!response.ok || !status.ok) throw new Error(status.error || '服务不可用');
     serverDevice = status.device || null;
     serverSupportsStream = Boolean(status.capabilities?.mjpeg_stream);
+    serverSupportsWebSocket = Boolean(status.capabilities?.websocket_stream && window.WebSocket);
     updateModeUi();
     els.webglBadge.classList.add('ok');
     els.webglBadge.lastChild.textContent = ` ${deviceLabel()} 就绪 · ${status.gpu.free_mib} MiB`;
@@ -283,15 +299,86 @@ function updateStreamMetrics(stats) {
   els.serverMetrics.textContent = `${stats.width}×${stats.height}${lod} · ${stats.render_ms || '—'} ms · ${stats.peak_allocated_mib || '—'} MiB`;
 }
 
+function recordDisplayedServerFrame() {
+  streamedFrames++;
+  const now = performance.now();
+  if (now - streamFpsStartedAt > 700) {
+    els.fpsValue.textContent = Math.max(1, Math.round(streamedFrames * 1000 / (now - streamFpsStartedAt)));
+    streamedFrames = 0;
+    streamFpsStartedAt = now;
+  }
+  els.serverViewport.classList.add('ready');
+  if (!serverDrag) setHybridVisible(false);
+}
+
+async function displayWebSocketFrame(packet) {
+  serverFramePending = packet;
+  if (serverFrameDecoding) return;
+  serverFrameDecoding = true;
+  try {
+    while (serverFramePending && serverSession && serverSocket) {
+      const latest = serverFramePending;
+      serverFramePending = null;
+      const buffer = latest instanceof ArrayBuffer ? latest : await latest.arrayBuffer();
+      if (buffer.byteLength < 6) continue;
+      const view = new DataView(buffer);
+      const statsLength = view.getUint32(0, false);
+      if (statsLength <= 0 || statsLength + 4 >= buffer.byteLength) continue;
+      const stats = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 4, statsLength)));
+      if (Number.isFinite(stats.client_seq)) {
+        serverSocketAckSeq = Math.max(serverSocketAckSeq, stats.client_seq);
+        if (serverSocketPending && !serverSocketRaf) {
+          serverSocketRaf = requestAnimationFrame(flushServerSocketUpdate);
+        }
+      }
+      const jpeg = new Blob([buffer.slice(4 + statsLength)], { type: 'image/jpeg' });
+      const bitmap = await createImageBitmap(jpeg);
+      // 解码期间如果已有更新，只画最新帧，避免旧视角排队造成拖尾。
+      if (serverFramePending) {
+        bitmap.close();
+        continue;
+      }
+      if (els.serverCanvas.width !== bitmap.width) els.serverCanvas.width = bitmap.width;
+      if (els.serverCanvas.height !== bitmap.height) els.serverCanvas.height = bitmap.height;
+      const context = els.serverCanvas.getContext('2d', { alpha: false });
+      context.drawImage(bitmap, 0, 0);
+      bitmap.close();
+      updateStreamMetrics(stats);
+      recordDisplayedServerFrame();
+    }
+  } catch (error) {
+    console.warn('WebSocket 帧解码失败:', error);
+  } finally {
+    serverFrameDecoding = false;
+    if (serverFramePending && serverSession && serverSocket) void displayWebSocketFrame(serverFramePending);
+  }
+}
+
 async function closeServerSession() {
   clearTimeout(serverSettleTimer);
   clearInterval(serverMetricsTimer);
+  if (serverSocketRaf) cancelAnimationFrame(serverSocketRaf);
   serverSettleTimer = null;
   serverMetricsTimer = null;
+  serverSocketRaf = null;
+  serverSocketSentSeq = 0;
+  serverSocketAckSeq = 0;
   serverUpdatePending = null;
+  serverSocketPending = null;
+  serverFramePending = null;
   const closingSession = serverSession;
   serverSession = null;
+  const closingSocket = serverSocket;
+  serverSocket = null;
+  if (closingSocket) closingSocket.close(1000, 'session closed');
+  els.serverViewport.classList.remove('websocket', 'preview-visible');
+  els.serverFrame.onload = null;
+  els.serverFrame.onerror = null;
   els.serverFrame.removeAttribute('src');
+  if (serverFrameUrl) URL.revokeObjectURL(serverFrameUrl);
+  serverFrameUrl = null;
+  els.serverCanvas.width = 0;
+  els.serverCanvas.height = 0;
   if (closingSession) {
     fetch(`${API_BASE}/api/session/${closingSession}`, {
       method: 'DELETE', keepalive: true
@@ -397,7 +484,52 @@ function setHybridVisible(visible) {
   document.getElementById('serverPreview')?.classList.toggle('visible', visible);
   // 防重影：本地预览显示的是当前拖动相机，而服务端帧仍是上一时刻相机；
   // 两者错位叠加就是“多帧重叠”。预览可见时隐藏服务端帧，预览淡出后恢复。
-  els.serverFrame.style.display = visible ? 'none' : '';
+  els.serverViewport.classList.toggle('preview-visible', visible);
+}
+
+function attachServerWebSocket(payload) {
+  return new Promise((resolve, reject) => {
+    const endpoint = new URL(payload.websocket_url, API_BASE);
+    endpoint.protocol = endpoint.protocol === 'https:' ? 'wss:' : 'ws:';
+    const socket = new WebSocket(endpoint);
+    const sessionId = payload.session;
+    let opened = false;
+    const timeout = setTimeout(() => {
+      if (!opened) {
+        socket.close();
+        reject(new Error('WebSocket 连接超时'));
+      }
+    }, 5000);
+    socket.binaryType = 'arraybuffer';
+    socket.onmessage = (event) => void displayWebSocketFrame(event.data);
+    socket.onopen = () => {
+      opened = true;
+      clearTimeout(timeout);
+      serverSocket = socket;
+      serverSocketSentSeq = 0;
+      serverSocketAckSeq = 0;
+      els.serverViewport.classList.add('websocket');
+      resolve(true);
+    };
+    socket.onerror = () => {
+      if (!opened) {
+        clearTimeout(timeout);
+        reject(new Error('WebSocket 连接失败'));
+      }
+    };
+    socket.onclose = () => {
+      clearTimeout(timeout);
+      if (!opened) return;
+      if (serverSocket === socket) serverSocket = null;
+      if (serverSession === sessionId && renderLocation === 'server') {
+        // 自动降级到兼容性更高的 MJPEG，不让传输层故障中断查看。
+        serverSupportsWebSocket = false;
+        serverSession = null;
+        showToast('低延迟通道已断开，正在切换兼容流…', true);
+        void openServerSession().then(ok => { if (!ok) void requestServerRender(false); });
+      }
+    };
+  });
 }
 
 async function openServerSession() {
@@ -412,17 +544,21 @@ async function openServerSession() {
     if (!response.ok) return false;
     const payload = await response.json();
     serverSession = payload.session;
+    if (serverSupportsWebSocket && payload.websocket_url) {
+      try {
+        await attachServerWebSocket(payload);
+        return true;
+      } catch (error) {
+        console.warn('WebSocket 不可用，回退 MJPEG:', error);
+        serverSupportsWebSocket = false;
+        await closeServerSession();
+        return openServerSession();
+      }
+    }
+    els.serverViewport.classList.remove('websocket');
     els.serverFrame.crossOrigin = 'anonymous';
     els.serverFrame.onload = () => {
-      streamedFrames++;
-      const now = performance.now();
-      if (now - streamFpsStartedAt > 700) {
-        els.fpsValue.textContent = Math.max(1, Math.round(streamedFrames * 1000 / (now - streamFpsStartedAt)));
-        streamedFrames = 0;
-        streamFpsStartedAt = now;
-      }
-      els.serverViewport.classList.add('ready');
-      if (!serverDrag) setHybridVisible(false);
+      recordDisplayedServerFrame();
     };
     els.serverFrame.src = new URL(payload.stream_url, API_BASE).href;
     serverMetricsTimer = setInterval(pollServerMetrics, 700);
@@ -433,7 +569,30 @@ async function openServerSession() {
   }
 }
 
+function flushServerSocketUpdate() {
+  serverSocketRaf = null;
+  if (!serverSocketPending || !serverSocket || serverSocket.readyState !== WEBSOCKET_OPEN) return;
+  // Keep at most two unacknowledged viewpoints in flight. Frame metadata
+  // carries client_seq back as the acknowledgement, preventing a slow link
+  // from building a long queue of stale camera states behind the pointer.
+  if (serverSocketSentSeq - serverSocketAckSeq >= 2) return;
+  if (serverSocket.bufferedAmount > 128 * 1024) {
+    serverSocketRaf = requestAnimationFrame(flushServerSocketUpdate);
+    return;
+  }
+  const latest = serverSocketPending;
+  serverSocketPending = null;
+  serverSocketSentSeq++;
+  serverSocket.send(JSON.stringify({ ...latest, client_seq: serverSocketSentSeq }));
+  if (serverSocketPending) serverSocketRaf = requestAnimationFrame(flushServerSocketUpdate);
+}
+
 async function updateServerSession(payload) {
+  if (serverSocket?.readyState === WEBSOCKET_OPEN) {
+    serverSocketPending = payload;
+    if (!serverSocketRaf) serverSocketRaf = requestAnimationFrame(flushServerSocketUpdate);
+    return;
+  }
   serverUpdatePending = payload;
   if (serverUpdateRunning || !serverSession) return;
   serverUpdateRunning = true;

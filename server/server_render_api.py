@@ -4,11 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import gc
+import hashlib
 import json
 import math
 import mimetypes
 import os
+import select
+import socket
+import struct
 import subprocess
 import threading
 import time
@@ -311,6 +316,7 @@ class RendererState:
             "capabilities": {
                 "adaptive_lod": True,
                 "mjpeg_stream": True,
+                "websocket_stream": True,
                 "latest_camera_wins": True,
                 "spatial_lod": bool(self.spatial_lod and self.spatial is not None),
                 "stream_concurrency": len(self.streams),
@@ -686,6 +692,14 @@ class SessionRegistry:
 
 class ApiHandler(BaseHTTPRequestHandler):
     server_version = "LumaSplatServer/1.1"
+    protocol_version = "HTTP/1.1"
+
+    def setup(self) -> None:
+        super().setup()
+        # Camera updates and MJPEG boundaries are latency-sensitive small
+        # writes. Disable Nagle buffering so they are not held for the TCP
+        # delayed-ACK window (commonly ~200 ms on tunneled connections).
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     @property
     def app(self):
@@ -728,6 +742,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 parts = path.strip("/").split("/")
                 if len(parts) == 4 and parts[3] == "stream":
                     self.stream_session(parts[2])
+                elif len(parts) == 4 and parts[3] == "ws":
+                    self.websocket_session(parts[2])
                 elif len(parts) == 3:
                     session = self.app.sessions.get(parts[2])
                     self.send_json(HTTPStatus.OK, {
@@ -816,6 +832,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "session": session.id,
                     "stream_url": f"/api/session/{session.id}/stream",
+                    "websocket_url": f"/api/session/{session.id}/ws",
                 })
             elif path.startswith("/api/session/") and path.endswith("/camera"):
                 parts = path.strip("/").split("/")
@@ -855,6 +872,44 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise ValueError("请求参数必须是 JSON object")
         return payload
 
+    def render_session_frame(
+        self, session: RenderSession, request: dict, revision: int
+    ) -> tuple[bytes, dict]:
+        """Render one coalesced session revision and update adaptive LOD state."""
+        active_request = request
+        if self.app.auto_lod:
+            ceiling = self.app.state.lod_fraction(request.get("lod", "full"))
+            if session.auto_fraction is None:
+                session.auto_fraction = ceiling
+            if ceiling > session.auto_fraction + 1e-6:
+                # 相机停止后的高质量帧：仅当上一帧未超预算时立即恢复，避免振荡。
+                if session.last_rt is None or session.last_rt <= self.app.frame_budget_ms:
+                    session.auto_fraction = ceiling
+            else:
+                session.auto_fraction = min(session.auto_fraction, ceiling)
+            active_request = {**request, "lod": round(session.auto_fraction, 4)}
+
+        image, stats = self.app.state.render(active_request)
+        session.last_rt = stats["render_ms"]
+        if self.app.auto_lod:
+            session.auto_frames += 1
+            budget = self.app.frame_budget_ms
+            # 前 3 帧跳过调整，避开显存分配/内核加载的瞬时尖峰。
+            if session.auto_frames > 3:
+                rt = stats["render_ms"]
+                if rt > budget * 1.2:
+                    session.auto_fraction = max(
+                        0.05, session.auto_fraction * budget / max(rt, 1.0))
+                elif rt < budget * 0.5:
+                    session.auto_fraction = min(ceiling, session.auto_fraction * 1.15)
+        session.stats = {
+            **stats,
+            "revision": revision,
+            "client_seq": request.get("client_seq"),
+            "lod_auto": round(session.auto_fraction, 3) if self.app.auto_lod else None,
+        }
+        return image, session.stats
+
     def stream_session(self, session_id: str) -> None:
         session = self.app.sessions.get(session_id)
         if not session.attach_stream():
@@ -884,10 +939,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                 f"Content-Length: {len(image)}\r\n"
                 f"X-Render-Stats: {stats_header}\r\n\r\n"
             ).encode("ascii")
-            self.wfile.write(headers)
-            self.wfile.write(image)
-            self.wfile.write(b"\r\n--frame\r\n")
+            # Keep the JPEG and its following boundary in one socket write.
+            # A separate tiny boundary write can add one delayed-ACK stall
+            # per frame on higher-latency or tunneled connections.
+            self.wfile.write(headers + image + b"\r\n--frame\r\n")
             self.wfile.flush()
+
+        def peer_disconnected() -> bool:
+            """Detect a closed idle MJPEG socket without sending keepalive frames."""
+            try:
+                readable, _, _ = select.select([self.connection], [], [], 0)
+                return bool(readable and self.connection.recv(1, socket.MSG_PEEK) == b"")
+            except (ConnectionResetError, OSError, ValueError):
+                return True
 
         try:
             while not session.closed:
@@ -901,45 +965,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                     break
                 request, revision = item
                 if revision <= rendered_revision:
+                    if peer_disconnected():
+                        break
                     if last_image is not None and last_stats is not None and not idle_repeat_sent:
                         send_frame(last_image, last_stats)
                         idle_repeat_sent = True
                     continue
-                active_request = request
-                if self.app.auto_lod:
-                    ceiling = self.app.state.lod_fraction(request.get("lod", "full"))
-                    if session.auto_fraction is None:
-                        session.auto_fraction = ceiling
-                    if ceiling > session.auto_fraction + 1e-6:
-                        # 相机刚停止（settle 帧）：客户端明确要求比当前自动档位更高的质量。
-                        # 仅当机器刚证明有余量（上一帧在预算内）或尚无参考帧时立即按该档
-                        # 渲染，避免低配机器上“升一档又降一档”的振荡；否则保持降档。
-                        if session.last_rt is None or session.last_rt <= self.app.frame_budget_ms:
-                            session.auto_fraction = ceiling
-                    else:
-                        session.auto_fraction = min(session.auto_fraction, ceiling)
-                    active_request = {**request, "lod": round(session.auto_fraction, 4)}
-                last_image, last_stats = self.app.state.render(active_request)
+                last_image, last_stats = self.render_session_frame(session, request, revision)
                 rendered_revision = revision
-                session.last_rt = last_stats["render_ms"]
-                if self.app.auto_lod:
-                    session.auto_frames += 1
-                    budget = self.app.frame_budget_ms
-                    # 前 3 帧跳过调整，避开显存分配/内核加载的瞬时尖峰。
-                    if session.auto_frames > 3:
-                        rt = last_stats["render_ms"]
-                        if rt > budget * 1.2:
-                            # 超预算：按超出比例同比例降档（快速保帧率）。
-                            session.auto_fraction = max(
-                                0.05, session.auto_fraction * budget / max(rt, 1.0))
-                        elif rt < budget * 0.5:
-                            # 有余量：每帧最多升 15%，逐步细化回客户端要求的档位。
-                            session.auto_fraction = min(ceiling, session.auto_fraction * 1.15)
-                session.stats = {
-                    **last_stats, "revision": revision,
-                    "lod_auto": round(session.auto_fraction, 3) if self.app.auto_lod else None,
-                }
-                send_frame(last_image, session.stats)
+                send_frame(last_image, last_stats)
                 idle_repeat_sent = False
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -947,6 +981,117 @@ class ApiHandler(BaseHTTPRequestHandler):
             print(f"stream {session_id} stopped: {exc}", flush=True)
         finally:
             session.detach_stream()
+
+    def websocket_session(self, session_id: str) -> None:
+        """Bidirectional low-latency camera control and JPEG frame stream."""
+        if self.headers.get("Upgrade", "").lower() != "websocket":
+            raise ValueError("需要 WebSocket Upgrade")
+        key = self.headers.get("Sec-WebSocket-Key", "").strip()
+        if not key:
+            raise ValueError("缺少 Sec-WebSocket-Key")
+
+        session = self.app.sessions.get(session_id)
+        if not session.attach_stream():
+            self.send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "该会话已有帧流连接"})
+            return
+
+        accept = base64.b64encode(hashlib.sha1(
+            (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+        ).digest()).decode("ascii")
+        self.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        self.close_connection = True
+
+        send_lock = threading.Lock()
+
+        def read_exact(length: int) -> bytes:
+            chunks = bytearray()
+            while len(chunks) < length:
+                # BaseHTTPRequestHandler parses the upgrade request through
+                # a buffered reader. A low-latency client can send its first
+                # WebSocket frame close enough to the handshake that bytes
+                # are already prefetched into rfile; reading the raw socket
+                # would then wait forever while those bytes sit in the buffer.
+                chunk = self.rfile.read(length - len(chunks))
+                if not chunk:
+                    raise ConnectionResetError("WebSocket disconnected")
+                chunks.extend(chunk)
+            return bytes(chunks)
+
+        def send_packet(opcode: int, payload: bytes) -> None:
+            length = len(payload)
+            if length < 126:
+                header = bytes((0x80 | opcode, length))
+            elif length <= 0xFFFF:
+                header = bytes((0x80 | opcode, 126)) + struct.pack("!H", length)
+            else:
+                header = bytes((0x80 | opcode, 127)) + struct.pack("!Q", length)
+            with send_lock:
+                self.connection.sendall(header + payload)
+
+        def receive_camera_updates() -> None:
+            try:
+                while not session.closed:
+                    first, second = read_exact(2)
+                    opcode = first & 0x0F
+                    masked = bool(second & 0x80)
+                    length = second & 0x7F
+                    if length == 126:
+                        length = struct.unpack("!H", read_exact(2))[0]
+                    elif length == 127:
+                        length = struct.unpack("!Q", read_exact(8))[0]
+                    if length > 64 * 1024:
+                        raise ValueError("WebSocket 相机参数过大")
+                    mask = read_exact(4) if masked else b""
+                    payload = read_exact(length)
+                    if masked:
+                        payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+                    if opcode == 0x8:
+                        break
+                    if opcode == 0x9:
+                        send_packet(0xA, payload[:125])
+                        continue
+                    if opcode != 0x1 or not (first & 0x80):
+                        continue
+                    request = json.loads(payload.decode("utf-8"))
+                    if isinstance(request, dict):
+                        session.update(request)
+            except (BrokenPipeError, ConnectionResetError, OSError, ValueError, json.JSONDecodeError):
+                pass
+            finally:
+                session.close()
+
+        receiver = threading.Thread(target=receive_camera_updates, daemon=True)
+        receiver.start()
+        rendered_revision = 0
+        try:
+            while not session.closed:
+                item = session.next_request(rendered_revision, timeout=1.0)
+                if item is None:
+                    break
+                request, revision = item
+                if revision <= rendered_revision:
+                    continue
+                image, stats = self.render_session_frame(session, request, revision)
+                rendered_revision = revision
+                stats_bytes = json.dumps(stats, separators=(",", ":")).encode("utf-8")
+                send_packet(0x2, struct.pack("!I", len(stats_bytes)) + stats_bytes + image)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        except Exception as exc:
+            print(f"websocket {session_id} stopped: {exc}", flush=True)
+        finally:
+            session.close()
+            session.detach_stream()
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            receiver.join(timeout=1.0)
+            self.app.sessions.delete(session_id)
 
     def receive_model(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))

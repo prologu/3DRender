@@ -33,7 +33,9 @@ fi
 if [[ "${AUTO_LOD:-true}" == "false" ]]; then
   args+=(--no-auto-lod)
 fi
-if [[ "${SPATIAL_LOD:-true}" == "false" ]]; then
+if [[ "${SPATIAL_LOD:-false}" == "true" ]]; then
+  args+=(--spatial-lod)
+else
   args+=(--no-spatial-lod)
 fi
 
