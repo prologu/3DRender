@@ -143,18 +143,17 @@ function lodFraction() {
 
 function serverRenderPayload(interactive = false) {
   const performanceMode = els.qualitySelect.value === 'performance';
-  const resolution = interactive
-    ? (performanceMode ? { width: 640, height: 360 } : { width: 800, height: 450 })
-    : serverResolution();
   const requestedLod = lodFraction();
   return {
     ...serverCamera,           // 含 yaw/pitch/distance/pan
-    ...resolution,
+    ...serverResolution(),
     background: backgroundRgb(),
     fov: 55,
-    // 交互时优先保证连续反馈；停止 140 ms 后自动恢复用户选择的分辨率和点数。
-    lod: interactive ? Math.min(requestedLod, performanceMode ? 0.25 : 0.35) : requestedLod,
-    jpeg_quality: interactive ? (performanceMode ? 68 : 74) : (performanceMode ? 82 : 90),
+    // 旋转前后严格使用相同点集，避免交互帧暗中降到 25%/35% 后出现结构消失。
+    // 需要降低负载时由用户显式选择性能模式或高斯加载量，而不是随鼠标状态切换模型。
+    lod: requestedLod,
+    lock_lod: true,
+    jpeg_quality: performanceMode ? 82 : 90,
     interactive
   };
 }

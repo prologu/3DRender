@@ -877,8 +877,9 @@ class ApiHandler(BaseHTTPRequestHandler):
     ) -> tuple[bytes, dict]:
         """Render one coalesced session revision and update adaptive LOD state."""
         active_request = request
-        if self.app.auto_lod:
-            ceiling = self.app.state.lod_fraction(request.get("lod", "full"))
+        ceiling = self.app.state.lod_fraction(request.get("lod", "full"))
+        lock_lod = request.get("lock_lod") is True
+        if self.app.auto_lod and not lock_lod:
             if session.auto_fraction is None:
                 session.auto_fraction = ceiling
             if ceiling > session.auto_fraction + 1e-6:
@@ -888,10 +889,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             else:
                 session.auto_fraction = min(session.auto_fraction, ceiling)
             active_request = {**request, "lod": round(session.auto_fraction, 4)}
+        elif lock_lod:
+            # The browser exposes an explicit Gaussian-load slider. Keep that
+            # selected set stable between still and interactive frames so
+            # orbiting never makes geometry disappear merely to chase FPS.
+            session.auto_fraction = ceiling
 
         image, stats = self.app.state.render(active_request)
         session.last_rt = stats["render_ms"]
-        if self.app.auto_lod:
+        if self.app.auto_lod and not lock_lod:
             session.auto_frames += 1
             budget = self.app.frame_budget_ms
             # 前 3 帧跳过调整，避开显存分配/内核加载的瞬时尖峰。
@@ -906,7 +912,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             **stats,
             "revision": revision,
             "client_seq": request.get("client_seq"),
-            "lod_auto": round(session.auto_fraction, 3) if self.app.auto_lod else None,
+            "interactive": request.get("interactive") is True,
+            "lod_locked": lock_lod,
+            "lod_auto": round(session.auto_fraction, 3) if self.app.auto_lod and not lock_lod else None,
         }
         return image, session.stats
 
