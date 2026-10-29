@@ -8,13 +8,15 @@
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0",
     "test:client": "node tests/smoke.cjs",
+    "test:paged": "node tests/paged-smoke.cjs",
     "test:server": "node tests/server-smoke.cjs",
     "test:stream": "node tests/server-stream-smoke.cjs",
     "test:mjpeg": "node tests/server-mjpeg-fallback.cjs"
   },
   "dependencies": {
     "@mkkellogg/gaussian-splats-3d": "0.4.7",
-    "three": "0.170.0"
+    "@sparkjsdev/spark": "2.4.0",
+    "three": "0.180.0"
   },
   "devDependencies": {
     "playwright-core": "1.62.1",

@@ -52,6 +52,21 @@ class CameraMathTests(unittest.TestCase):
         np.testing.assert_allclose(base, wrapped, atol=1e-5)
 
 
+class RenderSessionTests(unittest.TestCase):
+    def test_superseded_frames_are_counted_before_network_send(self) -> None:
+        session = SERVER.RenderSession("test", {"client_seq": 1})
+        stats = {}
+        self.assertFalse(session.finish_render(1, stats))
+        session.mark_sent(stats)
+        self.assertEqual(stats["sent_frames"], 1)
+
+        revision = session.update({"client_seq": 2})
+        session.update({"client_seq": 3})
+        stale_stats = {}
+        self.assertTrue(session.finish_render(revision, stale_stats))
+        self.assertEqual(stale_stats["dropped_frames"], 1)
+        self.assertEqual(stale_stats["sent_frames"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
-

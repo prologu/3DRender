@@ -586,6 +586,9 @@ class RenderSession:
         self.stream_attached = False
         self.last_seen = time.monotonic()
         self.stats: dict | None = None
+        self.rendered_frames = 0
+        self.sent_frames = 0
+        self.dropped_frames = 0
         # 服务端自适应 LOD：在客户端 LOD 上限内按帧时间预算升降档。
         self.auto_fraction: float | None = None
         self.auto_frames = 0
@@ -611,6 +614,28 @@ class RenderSession:
             if self.revision <= rendered_revision:
                 return {}, rendered_revision
             return dict(self.request), self.revision
+
+    def finish_render(self, revision: int, stats: dict) -> bool:
+        """Record a rendered revision and report whether a newer camera replaced it."""
+        with self.condition:
+            self.rendered_frames += 1
+            stale = self.revision > revision
+            if stale:
+                self.dropped_frames += 1
+            stats.update({
+                "frame_id": self.rendered_frames,
+                "sent_frames": self.sent_frames,
+                "dropped_frames": self.dropped_frames,
+                "superseded": stale,
+            })
+            self.stats = stats
+            return stale
+
+    def mark_sent(self, stats: dict) -> None:
+        with self.condition:
+            self.sent_frames += 1
+            stats["sent_frames"] = self.sent_frames
+            self.stats = stats
 
     def attach_stream(self) -> bool:
         with self.condition:
@@ -981,6 +1006,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                     continue
                 last_image, last_stats = self.render_session_frame(session, request, revision)
                 rendered_revision = revision
+                if session.finish_render(revision, last_stats):
+                    # Rendering cannot be cancelled inside gsplat, but obsolete
+                    # results must not consume network bandwidth or browser decode.
+                    continue
+                session.mark_sent(last_stats)
                 send_frame(last_image, last_stats)
                 idle_repeat_sent = False
         except (BrokenPipeError, ConnectionResetError):
@@ -1085,6 +1115,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                     continue
                 image, stats = self.render_session_frame(session, request, revision)
                 rendered_revision = revision
+                if session.finish_render(revision, stats):
+                    continue
+                session.mark_sent(stats)
                 stats_bytes = json.dumps(stats, separators=(",", ":")).encode("utf-8")
                 send_packet(0x2, struct.pack("!I", len(stats_bytes)) + stats_bytes + image)
         except (BrokenPipeError, ConnectionResetError, OSError):

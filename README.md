@@ -1,13 +1,16 @@
 # 3DRender
 
-面向 3D Gaussian Splatting（3DGS）的 Web 查看与服务端渲染项目。项目提供两条互补路径：
+面向 3D Gaussian Splatting（3DGS）的 Web 查看与服务端渲染项目。项目提供三条互补路径：
 
 | 模式 | 渲染位置 | 支持格式 | 适用场景 |
 | --- | --- | --- | --- |
 | 浏览器本地渲染 | 用户浏览器 / WebGL 2 | `.ply`、`.splat`、`.ksplat`、`.spz` | 快速查看、无需后端、文件不上传 |
+| 大场景分页渲染 | 用户浏览器 / Spark 2.4 / WebGL 2 | 预构建 `.rad` + `.radc` | 城市级/任意总规模场景；按视角下载，固定显存工作集 |
 | GPU 服务端渲染 | Linux + NVIDIA GPU + gsplat | 标准 binary little-endian 3DGS `.ply` | 低配置客户端、大模型、统一算力 |
 
-服务端模式优先使用**单条双向 WebSocket**：同一连接上传相机状态、下传统计信息和 JPEG 帧；浏览器不支持或代理阻断 WebSocket 时自动回退 MJPEG。相机状态采用 latest-camera-wins，并以 `client_seq` 帧确认把未确认视角限制为 2 个，慢链路也不会让过期鼠标事件排成长队。网页端发送 `lock_lod=true`，拖动、移动和静止帧严格保持相同的分辨率、JPEG 质量和 Gaussian 集合；不会再为了追求 FPS 在旋转时暗中从 100% 降到 25%/35%，因此几何不会随鼠标按下而消失。性能由“高清/性能”分辨率和“高斯加载量”滑杆显式控制。未锁定 LOD 的 API 客户端仍可使用 `FRAME_BUDGET_MS` 自动调节，空间 LOD 为可选实验项（默认关闭）。
+服务端模式优先使用**单条双向 WebSocket**：同一连接上传相机状态、下传统计信息和 JPEG 帧；浏览器不支持或代理阻断 WebSocket 时自动回退 MJPEG。相机状态采用 latest-camera-wins，并以 `client_seq` 帧确认把未确认视角限制为 2 个。服务端完成一次渲染后还会再次检查 revision，已被新视角覆盖的旧帧不再占用网络和浏览器 JPEG 解码；交互帧使用较低 JPEG 质量，停止操作后的 settled frame 自动恢复高清。页面指标显示端到端确认时延和服务端丢弃的旧帧数。
+
+大场景模式使用 Spark 的预构建 LoD 树和共享 LRU page pool。场景总量可以远大于浏览器显存，实际显存只保留当前视角需要的 4M/8M Gaussian 工作集（移动端默认更低），并通过 `.RADC` 分块并行预取。该模式与 CityGS 的 Spark 路线兼容，但代码完全位于本仓库，没有修改 `citygs-spark-docker`。
 
 `yaw` 与 `pitch` 均支持连续 360° 轨道旋转；前后端使用在天顶/天底仍良定义的解析相机基。**左键拖动 = 旋转**、**右键拖动 = 屏幕平面移动**、**滚轮 = 缩放**；导航盘和 `WASD`/方向键也沿屏幕轴移动。高斯加载量滑杆实时设置点数比例上限，完整模型常驻 GPU 的硬上限与 out-of-core 路线见 [大规模场景路线](docs/LARGE_SCENES.md)。多个会话使用独立 CUDA stream；客户端混合粗模预览默认关闭，需要时用 `USE_HYBRID_PREVIEW=true` 开启。
 
@@ -16,7 +19,7 @@
 ```text
 3DRender/
 ├─ frontend/                      # Vite + GaussianSplats3D Web UI
-│  ├─ src/                        # 页面逻辑与样式
+│  ├─ src/                        # 页面逻辑、Spark 分页查看器与样式
 │  ├─ public/                     # 图标和离线示例
 │  ├─ tests/                      # 浏览器冒烟测试
 │  └─ deploy/run-viewer.sh        # 静态站点启动脚本
@@ -91,7 +94,34 @@ PORT=8088 bash ./deploy/run-viewer.sh
 
 脚本会优先使用部署包中的 `deploy/site/`，否则使用源码构建出的 `dist/`；也可通过 `SITE_DIR=/absolute/site` 指定目录。
 
+### 大场景分页模式
+
+在右上角选择“**大场景流式**”，输入 `.rad` 地址即可。也可直接分享带场景参数的地址：
+
+```text
+http://viewer.example/?scene=https%3A%2F%2Fassets.example%2Fcity-lod.rad
+```
+
+资源服务器必须允许跨域访问，并支持 HTTP Range；若使用 `--rad-chunked`，需要把 `.rad` 和所有同名 `.radc` 文件一起发布。建议为 `.rad/.radc` 设置长缓存，对入口 HTML 设置 `no-cache`。可在页面加载前配置缓存上限（必须按 65,536 对齐，代码会自动向下对齐）：
+
+```html
+<script>window.LUMA_MAX_PAGED_SPLATS = 8_388_608;</script>
+```
+
+离线转换采用 Spark 官方 `build-lod`，质量优先并输出可独立缓存的分块：
+
+```bash
+git clone https://github.com/sparkjsdev/spark.git
+cd spark
+npm install
+npm run build-lod -- /data/city.ply --quality --rad-chunked
+```
+
+转换后将 `city-lod.rad` 与 `city-lod-*.radc` 上传到静态资源服务。完整参数与坐标精度说明见 [Spark LoD 指南](https://github.com/sparkjsdev/spark/blob/main/docs/docs/lod-getting-started.md)。
+
 ## 3. GPU 服务端渲染
+
+> 这一 Python/gsplat 路径当前仍是 CUDA/NVIDIA 实现。RX 7700 XT 机器可以正常构建并托管前端和 `.RAD/.RADC`，也可以运行浏览器分页模式，但不能直接运行本节的 CUDA gsplat 服务端；AMD 原生服务端光栅化需要等 gsplat ROCm 后端稳定后再单独接入。
 
 ### 前置条件与固定版本
 
@@ -210,7 +240,7 @@ curl http://127.0.0.1:8090/api/status
 
 | 优化 | 行为 | 实测数据 |
 | --- | --- | --- |
-| WebSocket 双向低延迟流 | 相机 JSON 与 JPEG 帧复用一条持久连接；二进制帧为 `4-byte stats 长度 + stats JSON + JPEG`。客户端仅保留最新待发视角、最多 2 个未确认序号，并在解码拥塞时只绘制最新帧 | A5000、2,146,592 点、Tailscale 直连：默认高清 1280×720 / 100% Gaussian 交互显示间隔中位 33–35 ms（约 28–31 FPS）；性能 800×450 / 50% 为 28–29 ms（约 34–35 FPS）。旧的逐次 POST 控制链路约 3.3 FPS、帧间隔中位约 250 ms |
+| WebSocket 双向低延迟流 | 相机 JSON 与 JPEG 帧复用一条持久连接；二进制帧为 `4-byte stats 长度 + stats JSON + JPEG`。客户端仅保留最新待发视角、最多 2 个未确认序号，在解码拥塞时只绘制最新帧；服务端在 GPU 返回后再次丢弃 superseded revision。交互 JPEG 为 70/78，settled frame 恢复 82/90 | 减少鼠标快速移动时旧帧的网络传输、JPEG 解码和画布绘制；`E2E` 与 `dropped_frames` 可直接观察背压效果。既有 A5000 基线：高清约 28–31 FPS，性能约 34–35 FPS |
 | 旋转点集锁定 | 网页端所有会话使用 `lock_lod=true`；旋转帧与静止帧使用完全相同的分辨率、JPEG 质量和滑杆点数。协议统计返回 `interactive`、`lod_locked` 便于自动测试 | 2,146,592 点回归中，连续旋转每一帧均为 2,146,592 点、1280×720；50% 滑杆下每一帧均为 1,073,296 点、800×450，不再出现 100%↔25%/35% 结构跳变 |
 | 服务端自适应 LOD | 未设置 `lock_lod=true` 的 API 客户端，帧耗时超过 `FRAME_BUDGET_MS` 时按比例自动降 LOD，客户端档位为上限，有余量逐步回升 | 网页默认锁定点集以保证视觉连续；批处理或自定义客户端可不锁定并选择“帧率优先”的自动 LOD |
 | 空闲帧提交 | 相机静止 100 ms 后仅补发一次已编码 JPEG，促使 Chromium 提交首帧/最终帧；不重新调用 GPU 渲染，也不持续传输 | 浏览器静止首帧可见；之后保持空闲，无连续重传 |
@@ -222,11 +252,11 @@ curl http://127.0.0.1:8090/api/status
 | 交互手感 + 前后左右移动 + 高斯加载量滑杆 | ① 旋转前后保持同一固定点集；② 旋转灵敏度按视口尺寸计算（拖满视口高约转 120°）；③ 导航盘和键盘沿相机屏幕轴累计 `pan`，步长随距离缩放；④ 10%–100% 滑杆直接设置固定点数比例 | 旋转、移动、缩放三种操作互不混淆；跨极点移动方向保持一致；降低点数只会在用户调整滑杆时发生 |
 | 旋转与移动区分 + 上下反向修复 | ① **左键拖动 = 旋转、右键拖动 = 移动（屏幕平面平移）、滚轮 = 缩放**——鼠标键位明确区分旋转与移动（右键菜单已屏蔽）；② 导航盘（↑↓←→ + 中心停止）与 `WASD`/方向键使用**屏幕轴**（画面上/下/左/右），并与服务端共享同一组连续解析相机基，因此越过天顶/天底后移动方向仍与画面一致；③ `pointercancel` 与 `lostpointercapture` 均会结束拖动，避免鼠标移出窗口后产生“卡住”状态 | 浏览器测试核对：左键拖仅改变 yaw/pitch，右键拖仅改变 pan；越过旧俯仰限制后相机基仍保持正交，导航方向无极点退化 |
 
-未实现项见 [大规模场景路线](docs/LARGE_SCENES.md)：out-of-core 分块流式加载、深度排序缓存、WebRTC/H.264 多用户视频传输。当前 WebSocket 传 JPEG 已解决控制排队，但不是视频编码器，公网高并发仍建议 WebRTC。
+浏览器侧 out-of-core 分块流式加载已由 Spark `.RAD/.RADC` 路线落地；服务端 Python/gsplat 路径仍是完整模型常驻 GPU。后续服务端 tile cache 与 WebRTC/H.264 多用户视频传输见 [大规模场景路线](docs/LARGE_SCENES.md)。当前 WebSocket 传 JPEG 已解决控制排队，但不是视频编码器，公网高并发仍建议 WebRTC。
 
 ## 4. 前后端联调与访问
 
-浏览器页面右上角可切换“本地渲染 / 服务端渲染”。本地渲染时模型不离开设备；切换到服务端后，标准 PLY 才会上传到 API。
+浏览器页面右上角可切换“本地渲染 / 大场景流式 / 服务端渲染”。本地模式读取用户文件；大场景模式只按需 GET 远程 `.RAD/.RADC` 分块；切换到服务端后，标准 PLY 才会上传到 API。
 
 推荐的 A5000 单端口部署：
 

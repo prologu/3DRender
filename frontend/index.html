@@ -26,12 +26,13 @@
         <div class="top-actions">
           <div class="mode-switch" role="group" aria-label="渲染位置">
             <button id="clientMode" class="active" type="button">本地渲染</button>
+            <button id="streamMode" type="button">大场景流式</button>
             <button id="serverMode" type="button">服务端渲染</button>
           </div>
           <span id="webglBadge" class="status-badge"><i></i>检测渲染能力</span>
           <button id="openFileTop" class="button button-primary" type="button">
             <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg>
-            打开模型
+            <span id="openFileLabel">打开模型</span>
           </button>
         </div>
       </header>
@@ -50,6 +51,14 @@
           </div>
           <div class="format-list"><span>PLY</span><span>SPLAT</span><span>KSPLAT</span><span>SPZ</span></div>
         </div>
+        <form id="streamSource" class="stream-source" hidden>
+          <label for="streamUrl">分页场景地址</label>
+          <div>
+            <input id="streamUrl" type="url" inputmode="url" autocomplete="url" spellcheck="false" placeholder="https://example.com/scene.rad" />
+            <button id="loadStreamUrl" class="button button-primary" type="submit">加载场景</button>
+          </div>
+          <small>推荐 Spark <b>.RAD</b>（配套 .RADC 分块）；服务端需支持 CORS 与 HTTP Range。</small>
+        </form>
         <button id="loadDemo" class="text-button" type="button">没有模型？体验内置示例 <span>→</span></button>
       </section>
 

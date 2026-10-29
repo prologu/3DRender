@@ -12,11 +12,12 @@ const els = {
   togglePanel: $('#togglePanel'), closePanel: $('#closePanel'), resetView: $('#resetView'), screenshot: $('#screenshot'),
   fullscreen: $('#fullscreen'), backgroundSelect: $('#backgroundSelect'), qualitySelect: $('#qualitySelect'),
   dragOverlay: $('#dragOverlay'), toast: $('#toast'), webglBadge: $('#webglBadge'),
-  clientMode: $('#clientMode'), serverMode: $('#serverMode'), serverViewport: $('#serverViewport'),
+  clientMode: $('#clientMode'), streamMode: $('#streamMode'), serverMode: $('#serverMode'), serverViewport: $('#serverViewport'),
   serverFrame: $('#serverFrame'), serverCanvas: $('#serverCanvas'), serverMetrics: $('#serverMetrics'), welcomeDescription: $('#welcomeDescription'),
   dropTitle: $('#dropTitle'), dropSubtitle: $('#dropSubtitle'), backendLabel: $('#backendLabel'),
   renderModeLabel: $('#renderModeLabel'), privacyTitle: $('#privacyTitle'), privacyText: $('#privacyText'),
-  lodSlider: $('#lodSlider'), lodValue: $('#lodValue'), navPad: $('#navPad')
+  lodSlider: $('#lodSlider'), lodValue: $('#lodValue'), navPad: $('#navPad'), streamSource: $('#streamSource'),
+  streamUrl: $('#streamUrl'), openFileLabel: $('#openFileLabel')
 };
 
 const clientFormats = new Set(['ply', 'splat', 'ksplat', 'spz']);
@@ -27,6 +28,7 @@ async function loadClientRenderer() {
 }
 
 let viewer = null;
+let pagedViewer = null;
 let objectUrl = null;
 let activeFile = null;
 let toastTimer = null;
@@ -50,6 +52,8 @@ let serverSocketSentSeq = 0;
 let serverSocketAckSeq = 0;
 let serverFrameDecoding = false;
 let serverFramePending = null;
+let serverCanvasContext = null;
+let serverSentAt = new Map();
 let serverSettleTimer = null;
 let serverMetricsTimer = null;
 let streamedFrames = 0;
@@ -153,27 +157,39 @@ function serverRenderPayload(interactive = false) {
     // 需要降低负载时由用户显式选择性能模式或高斯加载量，而不是随鼠标状态切换模型。
     lod: requestedLod,
     lock_lod: true,
-    jpeg_quality: performanceMode ? 82 : 90,
+    // Motion frames favor latency/bandwidth; the settled frame restores quality.
+    jpeg_quality: interactive ? (performanceMode ? 70 : 78) : (performanceMode ? 82 : 90),
     interactive
   };
 }
 
 function updateModeUi() {
   const server = renderLocation === 'server';
-  els.clientMode.classList.toggle('active', !server);
+  const paged = renderLocation === 'paged';
+  const client = renderLocation === 'client';
+  els.clientMode.classList.toggle('active', client);
+  els.streamMode.classList.toggle('active', paged);
   els.serverMode.classList.toggle('active', server);
   els.serverViewport.classList.toggle('active', server);
   els.viewport.classList.toggle('server-hidden', server);
+  els.dropzone.hidden = paged;
+  els.streamSource.hidden = !paged;
+  els.loadDemo.hidden = paged;
+  els.lodSlider.closest('.setting-row').hidden = paged;
+  els.openFileLabel.textContent = paged ? '输入场景地址' : '打开模型';
+  els.openFileTop.querySelector('svg').style.display = paged ? 'none' : '';
   els.fileInput.accept = server ? '.ply' : '.ply,.splat,.ksplat,.spz';
-  els.welcomeDescription.textContent = server
+  els.welcomeDescription.textContent = paged
+    ? '按视角分页下载 .RAD/.RADC，只让当前可见工作集进入显存，适合城市级场景。'
+    : server
     ? `模型上传到隔离渲染服务，由 ${deviceLabel()} 完成光栅化，客户端只接收图像。`
     : '所有模型均在当前设备本地解析与渲染，不上传服务器。';
   els.dropTitle.textContent = server ? '上传标准 3DGS PLY 到服务端' : '拖放 3DGS 模型到这里';
   els.dropSubtitle.textContent = server ? '当前支持 binary little-endian PLY' : '或点击从本地选择文件';
-  els.backendLabel.textContent = server ? `${deviceLabel()} · gsplat` : 'WebGL 2';
-  els.renderModeLabel.textContent = server ? 'Server Frame' : '3D Gaussian';
-  els.privacyTitle.textContent = server ? '服务端模式' : '本地模式';
-  els.privacyText.textContent = server ? '模型会上传到当前隔离容器' : '文件不会离开你的浏览器';
+  els.backendLabel.textContent = server ? `${deviceLabel()} · gsplat` : paged ? 'Spark · WebGL 2' : 'WebGL 2';
+  els.renderModeLabel.textContent = server ? 'Server Frame' : paged ? 'Paged LOD' : '3D Gaussian';
+  els.privacyTitle.textContent = server ? '服务端模式' : paged ? '按需流式' : '本地模式';
+  els.privacyText.textContent = server ? '模型会上传到当前隔离容器' : paged ? '仅下载当前视角需要的分块' : '文件不会离开你的浏览器';
   els.controlHint.innerHTML = server
     ? `<b>左键拖动</b> 旋转 <i></i><b>右键拖动</b> 移动 <i></i><b>滚轮</b> 缩放 <i></i><b>WASD/方向键/导航盘</b> 移动`
     : '<b>左键</b> 旋转 <i></i><b>右键</b> 平移 <i></i><b>滚轮</b> 缩放';
@@ -185,6 +201,7 @@ async function switchMode(mode) {
   updateModeUi();
   if (mode === 'server') {
     await disposeViewer();
+    disposePagedViewer();
     els.viewport.classList.remove('ready');
     await connectServer();
   } else {
@@ -195,12 +212,25 @@ async function switchMode(mode) {
     if (serverFrameUrl) URL.revokeObjectURL(serverFrameUrl);
     serverFrameUrl = null;
     activeFile = null;
+    els.viewport.classList.remove('ready');
     els.modelPanel.classList.remove('visible');
     els.toolbar.classList.remove('visible');
     els.controlHint.classList.remove('visible');
     els.navPad.classList.remove('visible');
     els.welcome.classList.remove('hidden');
     updateCapabilityBadge();
+    if (mode === 'paged') {
+      await disposeViewer();
+      const initialUrl = new URLSearchParams(location.search).get('scene') || window.LUMA_PAGED_SCENE_URL || '';
+      if (initialUrl) {
+        els.streamUrl.value = initialUrl;
+        void loadPagedScene(initialUrl);
+      } else {
+        setTimeout(() => els.streamUrl.focus(), 0);
+      }
+    } else {
+      disposePagedViewer();
+    }
   }
 }
 
@@ -295,7 +325,9 @@ function updateStreamMetrics(stats) {
   const fps = stats.render_ms ? Math.round(1000 / stats.render_ms) : '—';
   els.fpsValue.textContent = fps;
   const lod = stats.gaussians ? ` · ${formatCount(stats.gaussians)} GS` : '';
-  els.serverMetrics.textContent = `${stats.width}×${stats.height}${lod} · ${stats.render_ms || '—'} ms · ${stats.peak_allocated_mib || '—'} MiB`;
+  const latency = Number.isFinite(stats.e2e_ms) ? ` · E2E ${Math.round(stats.e2e_ms)} ms` : '';
+  const dropped = stats.dropped_frames ? ` · 丢旧帧 ${stats.dropped_frames}` : '';
+  els.serverMetrics.textContent = `${stats.width}×${stats.height}${lod} · ${stats.render_ms || '—'} ms${latency}${dropped} · ${stats.peak_allocated_mib || '—'} MiB`;
 }
 
 function recordDisplayedServerFrame() {
@@ -326,6 +358,11 @@ async function displayWebSocketFrame(packet) {
       const stats = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 4, statsLength)));
       if (Number.isFinite(stats.client_seq)) {
         serverSocketAckSeq = Math.max(serverSocketAckSeq, stats.client_seq);
+        const sentAt = serverSentAt.get(stats.client_seq);
+        if (Number.isFinite(sentAt)) stats.e2e_ms = performance.now() - sentAt;
+        for (const seq of serverSentAt.keys()) {
+          if (seq <= stats.client_seq) serverSentAt.delete(seq);
+        }
         if (serverSocketPending && !serverSocketRaf) {
           serverSocketRaf = requestAnimationFrame(flushServerSocketUpdate);
         }
@@ -339,8 +376,8 @@ async function displayWebSocketFrame(packet) {
       }
       if (els.serverCanvas.width !== bitmap.width) els.serverCanvas.width = bitmap.width;
       if (els.serverCanvas.height !== bitmap.height) els.serverCanvas.height = bitmap.height;
-      const context = els.serverCanvas.getContext('2d', { alpha: false });
-      context.drawImage(bitmap, 0, 0);
+      serverCanvasContext ||= els.serverCanvas.getContext('2d', { alpha: false, desynchronized: true });
+      serverCanvasContext.drawImage(bitmap, 0, 0);
       bitmap.close();
       updateStreamMetrics(stats);
       recordDisplayedServerFrame();
@@ -362,6 +399,7 @@ async function closeServerSession() {
   serverSocketRaf = null;
   serverSocketSentSeq = 0;
   serverSocketAckSeq = 0;
+  serverSentAt.clear();
   serverUpdatePending = null;
   serverSocketPending = null;
   serverFramePending = null;
@@ -378,6 +416,7 @@ async function closeServerSession() {
   serverFrameUrl = null;
   els.serverCanvas.width = 0;
   els.serverCanvas.height = 0;
+  serverCanvasContext = null;
   if (closingSession) {
     fetch(`${API_BASE}/api/session/${closingSession}`, {
       method: 'DELETE', keepalive: true
@@ -582,6 +621,7 @@ function flushServerSocketUpdate() {
   const latest = serverSocketPending;
   serverSocketPending = null;
   serverSocketSentSeq++;
+  serverSentAt.set(serverSocketSentSeq, performance.now());
   serverSocket.send(JSON.stringify({ ...latest, client_seq: serverSocketSentSeq }));
   if (serverSocketPending) serverSocketRaf = requestAnimationFrame(flushServerSocketUpdate);
 }
@@ -723,6 +763,75 @@ async function disposeViewer() {
   }
 }
 
+function disposePagedViewer() {
+  if (!pagedViewer) return;
+  try { pagedViewer.dispose(); } catch (_) { /* best-effort cleanup */ }
+  pagedViewer = null;
+  window.__lumaPagedViewer = null;
+}
+
+function normalizeSceneUrl(value) {
+  const raw = String(value || '').trim();
+  if (!raw) throw new Error('请输入 .RAD 场景地址');
+  const url = new URL(raw, window.location.href);
+  if (!/^https?:$/.test(url.protocol)) throw new Error('场景地址必须使用 HTTP 或 HTTPS');
+  if (!url.pathname.toLowerCase().endsWith('.rad')) {
+    throw new Error('大场景分页模式需要 Spark .RAD 索引文件');
+  }
+  return url.href;
+}
+
+async function loadPagedScene(value) {
+  if (renderLocation !== 'paged') return;
+  if (!hasWebGL2()) return showToast('当前浏览器不支持 WebGL 2', true);
+  let sceneUrl;
+  try { sceneUrl = normalizeSceneUrl(value); } catch (error) { return showToast(readableError(error), true); }
+  showLoading('正在连接分页场景', '读取 .RAD 索引…');
+  els.openFileTop.disabled = true;
+  disposePagedViewer();
+  try {
+    const { PagedSceneViewer } = await import('./paged-viewer.js');
+    pagedViewer = new PagedSceneViewer({
+      root: els.viewport,
+      background: els.backgroundSelect.value,
+      quality: els.qualitySelect.value,
+      onProgress: setProgress,
+      onStats: ({ fps, activeSplats, maxPagedSplats }) => {
+        if (renderLocation !== 'paged') return;
+        els.fpsValue.textContent = fps || '—';
+        els.splatCount.textContent = `${formatCount(activeSplats)} / ${formatCount(maxPagedSplats)}`;
+      },
+      onReady: ({ name, maxPagedSplats, activeSplats }) => {
+        activeFile = { name, extension: 'rad', paged: true, url: sceneUrl };
+        els.fileName.textContent = name;
+        els.fileType.textContent = 'RAD';
+        els.fileSize.textContent = `按需分页 · 缓存上限 ${formatCount(maxPagedSplats)}`;
+        els.splatCount.textContent = `${formatCount(activeSplats)} / ${formatCount(maxPagedSplats)}`;
+      }
+    });
+    window.__lumaPagedViewer = pagedViewer;
+    await pagedViewer.load(sceneUrl);
+    els.viewport.classList.add('ready');
+    els.welcome.classList.add('hidden');
+    els.modelPanel.classList.add('visible');
+    els.toolbar.classList.add('visible');
+    els.controlHint.classList.add('visible');
+    els.navPad.classList.remove('visible');
+    hideLoading();
+    history.replaceState(null, '', `${location.pathname}?scene=${encodeURIComponent(sceneUrl)}`);
+    showToast('大场景索引已加载，细节将随视角按需到达');
+  } catch (error) {
+    console.error(error);
+    disposePagedViewer();
+    hideLoading();
+    els.viewport.classList.remove('ready');
+    els.welcome.classList.remove('hidden');
+    showToast(`流式场景加载失败：${readableError(error)}`, true);
+  } finally {
+    els.openFileTop.disabled = false;
+  }
+}
+
 async function loadScene(source, metadata, extension, skipDispose = false) {
   if (!hasWebGL2()) return showToast('当前浏览器不支持 WebGL 2', true);
   showLoading(metadata.demo ? '正在打开示例场景' : '正在读取模型');
@@ -818,6 +927,11 @@ function resetView() {
     showToast('服务端视角已重置');
     return;
   }
+  if (renderLocation === 'paged') {
+    pagedViewer?.reset();
+    showToast('流式场景视角已重置');
+    return;
+  }
   if (!viewer) return;
   viewer.camera.position.set(0, 0, 6);
   viewer.controls.target.set(0, 0, 0);
@@ -848,6 +962,15 @@ async function saveScreenshot() {
     }
     return;
   }
+  if (renderLocation === 'paged') {
+    if (!pagedViewer) return;
+    const link = document.createElement('a');
+    link.download = `${(activeFile?.name || 'paged-scene').replace(/\.[^.]+$/, '')}-view.png`;
+    link.href = pagedViewer.screenshot();
+    link.click();
+    showToast('流式场景截图已保存');
+    return;
+  }
   if (!viewer) return;
   viewer.render();
   const link = document.createElement('a');
@@ -873,13 +996,18 @@ function tickFps(now) {
   requestAnimationFrame(tickFps);
 }
 
-els.openFileTop.addEventListener('click', () => els.fileInput.click());
+els.openFileTop.addEventListener('click', () => renderLocation === 'paged' ? els.streamUrl.focus() : els.fileInput.click());
 els.dropzone.addEventListener('click', () => els.fileInput.click());
 els.dropzone.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') els.fileInput.click(); });
 els.fileInput.addEventListener('change', () => { handleFile(els.fileInput.files[0]); els.fileInput.value = ''; });
 els.loadDemo.addEventListener('click', () => loadDemo().catch((error) => showToast(readableError(error), true)));
 els.clientMode.addEventListener('click', () => switchMode('client'));
+els.streamMode.addEventListener('click', () => switchMode('paged'));
 els.serverMode.addEventListener('click', () => switchMode('server'));
+els.streamSource.addEventListener('submit', (event) => {
+  event.preventDefault();
+  void loadPagedScene(els.streamUrl.value);
+});
 els.togglePanel.addEventListener('click', () => setPanel(!els.modelPanel.classList.contains('visible')));
 els.closePanel.addEventListener('click', () => setPanel(false));
 els.resetView.addEventListener('click', resetView);
@@ -887,12 +1015,18 @@ els.screenshot.addEventListener('click', () => saveScreenshot());
 els.fullscreen.addEventListener('click', () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen());
 els.backgroundSelect.addEventListener('change', () => {
   if (renderLocation === 'server') scheduleServerRender(false);
+  else if (renderLocation === 'paged') pagedViewer?.setBackground(els.backgroundSelect.value);
   else if (viewer) viewer.renderer.setClearColor(els.backgroundSelect.value, 1);
 });
 els.qualitySelect.addEventListener('change', () => {
   if (renderLocation === 'server') {
     scheduleServerRender(false);
     showToast(els.qualitySelect.value === 'performance' ? '服务端性能模式' : '服务端高清模式');
+    return;
+  }
+  if (renderLocation === 'paged') {
+    pagedViewer?.setQuality(els.qualitySelect.value);
+    showToast(els.qualitySelect.value === 'performance' ? '流式性能模式' : '流式高清模式');
     return;
   }
   if (!viewer) return;
@@ -1033,3 +1167,8 @@ window.addEventListener('pagehide', () => {
 updateCapabilityBadge();
 updateModeUi();
 requestAnimationFrame(tickFps);
+const initialPagedScene = new URLSearchParams(location.search).get('scene');
+if (initialPagedScene) {
+  els.streamUrl.value = initialPagedScene;
+  void switchMode('paged');
+}

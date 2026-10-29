@@ -11,6 +11,7 @@ server/.venv/
 server/wheels/
 
 # Models, uploads, generated frames, and runtime state
+run/
 server/models/
 server/uploads/
 server/*.log
@@ -39,4 +40,3 @@ __pycache__/
 .env
 .env.*
 !.env.example
-

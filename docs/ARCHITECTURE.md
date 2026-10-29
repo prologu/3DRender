@@ -1,11 +1,13 @@
 # 技术架构
 
-## 两条渲染路径
+## 三条渲染路径
 
 ```mermaid
 flowchart LR
     U["浏览器用户"] --> UI["Vite Web UI"]
     UI -->|"本地文件"| W["GaussianSplats3D / WebGL 2"]
+    UI -->|".RAD 索引 + 按视角 .RADC"| L["Spark Paged LoD / WebGL 2"]
+    L --> Q["共享 LRU page pool（固定显存预算）"]
     UI -->|"相机状态"| S["会话 API"]
     S --> C["latest-camera 合并"]
     C --> G["gsplat / CUDA"]
@@ -16,13 +18,21 @@ flowchart LR
     M --> G
 ```
 
-浏览器本地模式支持 `.ply`、`.splat`、`.ksplat` 和 `.spz`，文件不离开用户设备。服务端模式目前接收标准 binary little-endian 3DGS PLY；服务进程解析并验证参数，把模型常驻一张指定 GPU，由 gsplat 完成光栅化。
+浏览器本地模式支持 `.ply`、`.splat`、`.ksplat` 和 `.spz`，文件不离开用户设备。分页模式使用 Spark 2.4 读取预构建 `.RAD` LoD 树，按当前相机并行拉取 `.RADC` chunk，LRU 驱逐不再需要的 page，因此场景总 Gaussian 数不受单机显存容量直接限制。服务端模式目前接收标准 binary little-endian 3DGS PLY；服务进程解析并验证参数，把模型常驻一张指定 NVIDIA GPU，由 gsplat 完成光栅化。
 
 ## 服务端帧流
 
 客户端创建 `/api/session` 后优先升级到双向 WebSocket：文本消息发送相机状态，二进制消息接收 `stats + JPEG`。相机消息带递增 `client_seq`，服务端随渲染帧确认；浏览器最多保留 2 个未确认视角，待发状态始终覆盖为最新值。这样既避免逐请求 RTT，又避免有序 TCP 中积压过期视角。WebSocket 不可用时回退到 `multipart/x-mixed-replace` MJPEG，并通过 POST 更新相机。
 
-两种协议都只渲染新 revision。MJPEG 在停止后仅补发一次已编码帧以提交 Chromium 缓冲，并探测空闲 socket 断开；WebSocket 不需要重复帧。默认最多 4 个会话、120 秒无流连接自动回收。各渲染调用从 CUDA stream 池取独立 stream，只有模型加载/更换持有全局互斥。
+两种协议都只领取最新 revision。GPU 调用本身不能中途取消，但返回后会在发送前再次比较当前 revision：过期结果计入 `dropped_frames`，不会进入 TCP、JPEG 解码或 Canvas。交互请求降低 JPEG 质量以减小传输，停止后补一张高质量帧。浏览器用 `client_seq` 的发送时间与帧确认计算 E2E 时延。MJPEG 在停止后仅补发一次已编码帧以提交 Chromium 缓冲，并探测空闲 socket 断开；WebSocket 不需要重复帧。默认最多 4 个会话、120 秒无流连接自动回收。各渲染调用从 CUDA stream 池取独立 stream，只有模型加载/更换持有全局互斥。
+
+## 浏览器分页 LoD
+
+- `paged-viewer.js` 仅在用户进入“大场景流式”后动态导入；普通首页、服务端模式不会下载约 1 MiB gzip 的 Spark chunk。
+- `.RAD/.RADC` 使用三条后台 fetch worker；根 LoD 先显示，细节按当前投影收益逐步细化。
+- page pool 默认桌面高清约 8M、桌面性能约 4M，移动设备为 4M/2M；`LUMA_MAX_PAGED_SPLATS` 可覆盖。
+- 高清模式 DPR 上限为 1.5，性能模式 DPR=1 并降低 LoD 目标；静止后采用按需渲染，分页队列忙时持续驱动，避免前台空转。
+- 由于 paged RAD 初始化完成时完整包围盒尚不可用，查看器等待第一个粗层 chunk 后只拟合一次相机，不跟随不断变化的 resident-cache bounds。
 
 ## 当前 LOD
 
@@ -44,7 +54,7 @@ flowchart LR
 - PLY 校验长度、字段、有限值和尺度语义，阻止异常 Gaussian 放大 tile buffer。
 - 会话数有硬上限，所有相机 JSON 和上传文件均有限制。
 - 上传以 4 MiB 块写盘，不在 HTTP 层复制整个文件。
-- 浏览器本地渲染依赖动态导入，服务端模式首屏只下载 UI 主包。
+- 两个浏览器渲染器均动态导入，服务端模式首屏只下载 UI 主包。
 
 ## 部署边界
 
