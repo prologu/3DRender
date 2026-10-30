@@ -12,6 +12,7 @@ import math
 import mimetypes
 import os
 import select
+import shutil
 import socket
 import struct
 import subprocess
@@ -63,15 +64,25 @@ PLY_TYPES = {
 
 
 def gpu_snapshot(physical_gpu: int) -> dict[str, int]:
-    output = subprocess.check_output(
-        [
-            "nvidia-smi", f"--id={physical_gpu}",
-            "--query-gpu=memory.used,memory.free,memory.total,utilization.gpu",
-            "--format=csv,noheader,nounits",
-        ], text=True,
-    ).strip()
-    used, free, total, util = (int(value.strip()) for value in output.split(","))
-    return {"used_mib": used, "free_mib": free, "total_mib": total, "util_percent": util}
+    """Return memory metrics on both CUDA and ROCm PyTorch builds."""
+    if torch.version.cuda and shutil.which("nvidia-smi"):
+        output = subprocess.check_output(
+            [
+                "nvidia-smi", f"--id={physical_gpu}",
+                "--query-gpu=memory.used,memory.free,memory.total,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ], text=True,
+        ).strip()
+        used, free, total, util = (int(value.strip()) for value in output.split(","))
+        return {"used_mib": used, "free_mib": free, "total_mib": total, "util_percent": util}
+    free, total = torch.cuda.mem_get_info(torch.device("cuda:0"))
+    free_mib, total_mib = int(free / 2**20), int(total / 2**20)
+    return {
+        "used_mib": total_mib - free_mib,
+        "free_mib": free_mib,
+        "total_mib": total_mib,
+        "util_percent": 0,
+    }
 
 
 def parse_ply_header(path: Path) -> tuple[int, int, np.dtype]:
@@ -187,7 +198,7 @@ class RendererState:
         stream_count: int = 4,
     ):
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA 不可用")
+            raise RuntimeError("PyTorch GPU 后端不可用（需要 CUDA 或 ROCm）")
         self.physical_gpu = physical_gpu
         self.device = torch.device("cuda:0")
         self.min_free_mib = min_free_mib
@@ -307,6 +318,8 @@ class RendererState:
             "backend": "gsplat",
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
+            "hip": torch.version.hip,
+            "platform": "rocm" if torch.version.hip else "cuda",
             "device": torch.cuda.get_device_name(self.device),
             "physical_gpu": self.physical_gpu,
             "memory_fraction": self.memory_fraction,

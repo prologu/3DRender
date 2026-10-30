@@ -1,0 +1,20 @@
+--- a/gsplat/hip/include/cooperative_groups/reduce.h
++++ b/gsplat/hip/include/cooperative_groups/reduce.h
+@@ -38,6 +38,9 @@
+ 
+ namespace cooperative_groups {
+ 
++// LUMA_ROCM_714: HIP 7.14 added these operators to cooperative_groups.
++#if !defined(HIP_VERSION_MAJOR) || HIP_VERSION_MAJOR < 7 || \
++    (HIP_VERSION_MAJOR == 7 && HIP_VERSION_MINOR < 14)
+ template <typename T>
+ struct plus {
+     __device__ T operator()(T a, T b) const { return a + b; }
+@@ -47,6 +50,7 @@
+ struct greater {
+     __device__ T operator()(T a, T b) const { return a > b ? a : b; }
+ };
++#endif
+ 
+ struct labeled_partition_identity {
+     __device__ int thread_rank() const { return 0; }

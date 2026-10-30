@@ -52,12 +52,17 @@
           <div class="format-list"><span>PLY</span><span>SPLAT</span><span>KSPLAT</span><span>SPZ</span></div>
         </div>
         <form id="streamSource" class="stream-source" hidden>
-          <label for="streamUrl">分页场景地址</label>
-          <div>
+          <label for="streamUrl">打开分页场景</label>
+          <div class="stream-url-row">
             <input id="streamUrl" type="url" inputmode="url" autocomplete="url" spellcheck="false" placeholder="https://example.com/scene.rad" />
             <button id="loadStreamUrl" class="button button-primary" type="submit">加载场景</button>
           </div>
-          <small>推荐 Spark <b>.RAD</b>（配套 .RADC 分块）；服务端需支持 CORS 与 HTTP Range。</small>
+          <div class="stream-divider"><span>或者从本机上传</span></div>
+          <div class="stream-upload-row">
+            <button id="selectSceneFiles" class="button button-secondary" type="button">选择 RAD/RADC 文件</button>
+            <button id="selectSceneFolder" class="button button-secondary" type="button">选择整个场景文件夹</button>
+          </div>
+          <small><b>最简单：</b>选择包含一个 .RAD 索引和配套 .RADC 分块的文件夹，上传完成后会自动加载。也可拖放整组文件。</small>
         </form>
         <button id="loadDemo" class="text-button" type="button">没有模型？体验内置示例 <span>→</span></button>
       </section>
@@ -141,11 +146,13 @@
       </div>
 
       <div id="dragOverlay" class="drag-overlay">
-        <div><svg viewBox="0 0 24 24"><path d="M12 15V3m0 0L7.5 7.5M12 3l4.5 4.5M4 15.5v2A2.5 2.5 0 0 0 6.5 20h11a2.5 2.5 0 0 0 2.5-2.5v-2"/></svg><strong>释放以打开模型</strong></div>
+        <div><svg viewBox="0 0 24 24"><path d="M12 15V3m0 0L7.5 7.5M12 3l4.5 4.5M4 15.5v2A2.5 2.5 0 0 0 6.5 20h11a2.5 2.5 0 0 0 2.5-2.5v-2"/></svg><strong id="dragOverlayText">释放以打开模型</strong></div>
       </div>
 
       <div id="toast" class="toast" role="alert"></div>
       <input id="fileInput" type="file" accept=".ply,.splat,.ksplat,.spz" hidden />
+      <input id="sceneFileInput" type="file" accept=".rad,.radc" multiple hidden />
+      <input id="sceneFolderInput" type="file" accept=".rad,.radc" webkitdirectory multiple hidden />
     </main>
     <script type="module" src="/src/main.js"></script>
   </body>

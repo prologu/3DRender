@@ -4,6 +4,7 @@ frontend/dist/
 frontend/.vite/
 frontend/tests/*.png
 frontend/tests/*.jpg
+frontend/deploy/scenes/
 
 # Server-local Python/CUDA environment and binary wheels
 server/python/

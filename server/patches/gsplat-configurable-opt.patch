@@ -1,0 +1,12 @@
+--- a/gsplat/hip/build.py
++++ b/gsplat/hip/build.py
+@@ -211,7 +211,8 @@
+             extra_hip_cflags += ["-Od"]
+     else:
+         if sys.platform != "win32":
+-            extra_cflags += ["-O3", "-DNDEBUG"]
++            opt_level = os.environ.get("GSPLAT_OPT_LEVEL", "3")
++            extra_cflags += [f"-O{opt_level}", "-DNDEBUG"]
+         else:
+             extra_cflags += ["/O2", "-DNDEBUG"]
+             extra_hip_cflags += ["-O2", "-DNDEBUG"]

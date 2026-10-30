@@ -6,13 +6,13 @@
 | --- | --- | --- | --- |
 | 浏览器本地渲染 | 用户浏览器 / WebGL 2 | `.ply`、`.splat`、`.ksplat`、`.spz` | 快速查看、无需后端、文件不上传 |
 | 大场景分页渲染 | 用户浏览器 / Spark 2.4 / WebGL 2 | 预构建 `.rad` + `.radc` | 城市级/任意总规模场景；按视角下载，固定显存工作集 |
-| GPU 服务端渲染 | Linux + NVIDIA GPU + gsplat | 标准 binary little-endian 3DGS `.ply` | 低配置客户端、大模型、统一算力 |
+| GPU 服务端渲染 | Linux + PyTorch GPU + gsplat | 标准 binary little-endian 3DGS `.ply` | NVIDIA/CUDA 为稳定路径；AMD/ROCm 为实验路径 |
 
 服务端模式优先使用**单条双向 WebSocket**：同一连接上传相机状态、下传统计信息和 JPEG 帧；浏览器不支持或代理阻断 WebSocket 时自动回退 MJPEG。相机状态采用 latest-camera-wins，并以 `client_seq` 帧确认把未确认视角限制为 2 个。服务端完成一次渲染后还会再次检查 revision，已被新视角覆盖的旧帧不再占用网络和浏览器 JPEG 解码；交互帧使用较低 JPEG 质量，停止操作后的 settled frame 自动恢复高清。页面指标显示端到端确认时延和服务端丢弃的旧帧数。
 
 大场景模式使用 Spark 的预构建 LoD 树和共享 LRU page pool。场景总量可以远大于浏览器显存，实际显存只保留当前视角需要的 4M/8M Gaussian 工作集（移动端默认更低），并通过 `.RADC` 分块并行预取。该模式与 CityGS 的 Spark 路线兼容，但代码完全位于本仓库，没有修改 `citygs-spark-docker`。
 
-`yaw` 与 `pitch` 均支持连续 360° 轨道旋转；前后端使用在天顶/天底仍良定义的解析相机基。**左键拖动 = 旋转**、**右键拖动 = 屏幕平面移动**、**滚轮 = 缩放**；导航盘和 `WASD`/方向键也沿屏幕轴移动。高斯加载量滑杆实时设置点数比例上限，完整模型常驻 GPU 的硬上限与 out-of-core 路线见 [大规模场景路线](docs/LARGE_SCENES.md)。多个会话使用独立 CUDA stream；客户端混合粗模预览默认关闭，需要时用 `USE_HYBRID_PREVIEW=true` 开启。
+`yaw` 与 `pitch` 均支持连续 360° 轨道旋转；前后端使用在天顶/天底仍良定义的解析相机基。**左键拖动 = 旋转**、**右键拖动 = 屏幕平面移动**、**滚轮 = 缩放**；导航盘和 `WASD`/方向键也沿屏幕轴移动。高斯加载量滑杆实时设置点数比例上限，完整模型常驻 GPU 的硬上限与 out-of-core 路线见 [大规模场景路线](docs/LARGE_SCENES.md)。多个会话使用独立 PyTorch GPU stream；客户端混合粗模预览默认关闭，需要时用 `USE_HYBRID_PREVIEW=true` 开启。
 
 ## 目录
 
@@ -22,8 +22,8 @@
 │  ├─ src/                        # 页面逻辑、Spark 分页查看器与样式
 │  ├─ public/                     # 图标和离线示例
 │  ├─ tests/                      # 浏览器冒烟测试
-│  └─ deploy/run-viewer.sh        # 静态站点启动脚本
-├─ server/                        # PyTorch + CUDA + gsplat 服务端
+│  └─ deploy/                     # 页面 + RAD/RADC 上传与 Range 场景服务
+├─ server/                        # PyTorch + CUDA/ROCm + gsplat 服务端
 │  ├─ server_render_api.py        # HTTP / WebSocket / MJPEG 渲染 API
 │  ├─ setup.sh                    # 在线或离线安装隔离依赖
 │  ├─ download-wheels.sh          # Linux 下载离线依赖包
@@ -92,17 +92,29 @@ cd /path/to/3DRender/frontend
 PORT=8088 bash ./deploy/run-viewer.sh
 ```
 
-脚本会优先使用部署包中的 `deploy/site/`，否则使用源码构建出的 `dist/`；也可通过 `SITE_DIR=/absolute/site` 指定目录。
+脚本会优先使用部署包中的 `deploy/site/`，否则使用源码构建出的 `dist/`；也可通过 `SITE_DIR=/absolute/site` 指定目录。它还会启动不依赖 GPU 的场景上传服务，并从 `SCENE_DIR`（默认 `deploy/scenes/`）提供支持 HTTP Range 的分页资源；`MAX_SCENE_GIB` 默认允许单场景 100 GiB。
 
 ### 大场景分页模式
 
-在右上角选择“**大场景流式**”，输入 `.rad` 地址即可。也可直接分享带场景参数的地址：
+在右上角选择“**大场景流式**”后有三种入口，推荐第一种：
+
+1. 点击“选择整个场景文件夹”，选择包含一个 `.rad` 和全部 `.radc` 分块的目录；页面上传后自动打开。
+2. 点击“选择 RAD/RADC 文件”，一次多选入口和全部分块；也可以把这一组文件拖到页面。
+3. 已有对象存储或静态资源地址时，仍可直接填写 `.rad` URL。
+
+上传入口要求站点由 `frontend/deploy/run-viewer.sh` 启动；`npm run preview` 只提供静态页面，不能接收上传。上传目录可持久化到单独数据盘：
+
+```bash
+SCENE_DIR=/data/luma-scenes MAX_SCENE_GIB=200 PORT=8088 bash ./deploy/run-viewer.sh
+```
+
+每组文件必须且只能有一个 `.rad`，并保持转换工具产生的 `.radc` 相对路径和文件名。选择文件夹时浏览器会自动去掉最外层目录。地址方式也可直接分享带场景参数的链接：
 
 ```text
 http://viewer.example/?scene=https%3A%2F%2Fassets.example%2Fcity-lod.rad
 ```
 
-资源服务器必须允许跨域访问，并支持 HTTP Range；若使用 `--rad-chunked`，需要把 `.rad` 和所有同名 `.radc` 文件一起发布。建议为 `.rad/.radc` 设置长缓存，对入口 HTML 设置 `no-cache`。可在页面加载前配置缓存上限（必须按 65,536 对齐，代码会自动向下对齐）：
+外部资源服务器必须允许跨域访问，并支持 HTTP Range；若使用 `--rad-chunked`，需要把 `.rad` 和所有同名 `.radc` 文件一起发布。内置场景服务已经实现 Range，无需额外配置。建议为 `.rad/.radc` 设置长缓存，对入口 HTML 设置 `no-cache`。可在页面加载前配置缓存上限（必须按 65,536 对齐，代码会自动向下对齐）：
 
 ```html
 <script>window.LUMA_MAX_PAGED_SPLATS = 8_388_608;</script>
@@ -121,7 +133,7 @@ npm run build-lod -- /data/city.ply --quality --rad-chunked
 
 ## 3. GPU 服务端渲染
 
-> 这一 Python/gsplat 路径当前仍是 CUDA/NVIDIA 实现。RX 7700 XT 机器可以正常构建并托管前端和 `.RAD/.RADC`，也可以运行浏览器分页模式，但不能直接运行本节的 CUDA gsplat 服务端；AMD 原生服务端光栅化需要等 gsplat ROCm 后端稳定后再单独接入。
+> NVIDIA/CUDA 仍是 gsplat 的稳定上游路径。AMD 已有官方 ROCm 包与上游 HIP PR，但 Radeon 支持尚未正式合并；本仓库提供 RX 7700 XT（`gfx1101`）实验构建脚本与 ROCm 7.14 兼容补丁。大场景 Spark 浏览器模式不依赖这套 GPU 服务端，无论 HIP 扩展是否可用都能运行。
 
 ### 前置条件与固定版本
 
@@ -130,6 +142,36 @@ npm run build-lod -- /data/city.ply --quality --rad-chunked
 - NVIDIA 驱动可运行 CUDA 11.8 构建的 PyTorch，先确认 `nvidia-smi` 正常。
 - 已验证组合：PyTorch `2.0.1+cu118`、gsplat `1.5.3+pt20cu118`、NumPy `1.26.4`、Pillow `10.4.0`、setuptools `80.10.2`（必须 <81，setuptools 81 移除了渲染路径用到的 `pkg_resources`）；`opencv-python-headless` 可选，个别构建上作为更快的 JPEG 后端（`LUMA_JPEG_BACKEND=opencv`）。
 - 依赖安装到 `server/python/`，不修改系统 Python，也不创建或停止系统服务。
+
+### AMD RX 7700 XT / ROCm 实验路径
+
+现有 `ljq-rocm` conda 环境可继续使用，不需要每次执行 Python 前手动 `source` 同一个脚本；但**每个新的 SSH shell** 都要重新 `conda activate`，因为激活只修改当前 shell。长期服务直接给 `LUMA_PYTHON` 绝对路径即可，不依赖 shell 激活状态。
+
+```bash
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate ljq-rocm
+python - <<'PY'
+import torch
+print(torch.__version__, torch.version.hip)
+print(torch.cuda.is_available(), torch.cuda.get_device_name(0))
+print(torch.cuda.get_device_properties(0).gcnArchName)
+PY
+```
+
+构建 gsplat HIP 扩展需要运行时包之外的编译器和开发头。优先从 AMD multi-arch 仓库补齐开发轮，然后执行仓库脚本：
+
+```bash
+python -m pip install --index-url https://repo.amd.com/rocm/whl-multi-arch/ rocm-sdk-devel==7.14.1
+PYTORCH_ROCM_ARCH=gfx1101 MAX_JOBS=2 bash ./server/setup-rocm-gsplat.sh
+```
+
+`setup-rocm-gsplat.sh` 固定使用已验证的 gsplat HIP PR revision，并应用 ROCm 7.14 的 cooperative-groups 兼容补丁。AMD 仓库下载较慢时，脚本也支持把 rocThrust、rocPRIM、hipCUB 等头文件放在 `~/luma/rocm-headers` 的轻量回退方式。启动时无需重新激活环境：
+
+```bash
+LUMA_PYTHON="$HOME/miniconda3/envs/ljq-rocm/bin/python" \
+PHYSICAL_GPU=0 MEMORY_FRACTION=0.70 MIN_FREE_MIB=1024 \
+bash ./server/run-render-server.sh
+```
 
 建议先检查：
 
@@ -208,7 +250,7 @@ bash ./run-render-server.sh
 
 | 变量 | 默认值 | 含义 |
 | --- | ---: | --- |
-| `PHYSICAL_GPU` | `3` | 绑定的物理 GPU 编号 |
+| `PHYSICAL_GPU` | `0` | 绑定的物理 GPU 编号 |
 | `RENDER_PORT` | `8090` | API 监听端口 |
 | `MODEL_PATH` | 空 | 启动时加载的标准 3DGS PLY |
 | `MEMORY_FRACTION` | `0.045` | PyTorch 单进程显存比例上限；共享 GPU 保持保守，专用 GPU 可提到 `0.25`+（24G 卡 ≈ 6 GiB，可常驻约 50M SH0 点） |

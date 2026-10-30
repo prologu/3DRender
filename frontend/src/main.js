@@ -17,7 +17,9 @@ const els = {
   dropTitle: $('#dropTitle'), dropSubtitle: $('#dropSubtitle'), backendLabel: $('#backendLabel'),
   renderModeLabel: $('#renderModeLabel'), privacyTitle: $('#privacyTitle'), privacyText: $('#privacyText'),
   lodSlider: $('#lodSlider'), lodValue: $('#lodValue'), navPad: $('#navPad'), streamSource: $('#streamSource'),
-  streamUrl: $('#streamUrl'), openFileLabel: $('#openFileLabel')
+  streamUrl: $('#streamUrl'), openFileLabel: $('#openFileLabel'), sceneFileInput: $('#sceneFileInput'),
+  sceneFolderInput: $('#sceneFolderInput'), selectSceneFiles: $('#selectSceneFiles'),
+  selectSceneFolder: $('#selectSceneFolder'), dragOverlayText: $('#dragOverlayText')
 };
 
 const clientFormats = new Set(['ply', 'splat', 'ksplat', 'spz']);
@@ -176,8 +178,9 @@ function updateModeUi() {
   els.streamSource.hidden = !paged;
   els.loadDemo.hidden = paged;
   els.lodSlider.closest('.setting-row').hidden = paged;
-  els.openFileLabel.textContent = paged ? '输入场景地址' : '打开模型';
-  els.openFileTop.querySelector('svg').style.display = paged ? 'none' : '';
+  els.openFileLabel.textContent = paged ? '上传场景文件夹' : '打开模型';
+  els.openFileTop.querySelector('svg').style.display = '';
+  els.dragOverlayText.textContent = paged ? '释放以上传 RAD/RADC 场景' : '释放以打开模型';
   els.fileInput.accept = server ? '.ply' : '.ply,.splat,.ksplat,.spz';
   els.welcomeDescription.textContent = paged
     ? '按视角分页下载 .RAD/.RADC，只让当前可见工作集进入显存，适合城市级场景。'
@@ -781,6 +784,97 @@ function normalizeSceneUrl(value) {
   return url.href;
 }
 
+function prepareSceneFiles(fileList) {
+  const candidates = Array.from(fileList || []).filter(file => ['rad', 'radc'].includes(getExtension(file.name)));
+  if (!candidates.length) throw new Error('请选择 .RAD 索引与配套 .RADC 分块');
+  const originalPaths = candidates.map(file => (file.webkitRelativePath || file.name).replace(/\\/g, '/'));
+  const firstParts = originalPaths.map(path => path.split('/'));
+  const stripRoot = firstParts.every(parts => parts.length > 1 && parts[0] === firstParts[0][0]);
+  const seen = new Set();
+  const files = candidates.map((file, index) => {
+    const parts = originalPaths[index].split('/').filter(Boolean);
+    const path = (stripRoot ? parts.slice(1) : parts).join('/');
+    if (!path || path.split('/').some(part => part === '.' || part === '..')) throw new Error('场景文件路径无效');
+    if (seen.has(path)) throw new Error(`存在重名文件：${path}`);
+    seen.add(path);
+    return { file, path };
+  });
+  const entries = files.filter(item => item.path.toLowerCase().endsWith('.rad'));
+  if (entries.length !== 1) throw new Error(`需要且只能包含一个 .RAD 入口文件（当前 ${entries.length} 个）`);
+  return { files, entry: entries[0].path, totalBytes: files.reduce((sum, item) => sum + item.file.size, 0) };
+}
+
+function encodedScenePath(path) {
+  return path.split('/').map(encodeURIComponent).join('/');
+}
+
+function uploadScenePart(url, file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', url);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.upload.onprogress = event => onProgress(event.loaded);
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      else {
+        let detail = '';
+        try { detail = JSON.parse(xhr.responseText).error; } catch (_) { detail = xhr.responseText; }
+        reject(new Error(detail || `上传失败（HTTP ${xhr.status}）`));
+      }
+    };
+    xhr.onerror = () => reject(new Error('场景上传网络连接失败'));
+    xhr.onabort = () => reject(new Error('场景上传已取消'));
+    xhr.send(file);
+  });
+}
+
+async function uploadPagedScene(fileList) {
+  if (renderLocation !== 'paged') return;
+  let prepared;
+  try { prepared = prepareSceneFiles(fileList); } catch (error) { return showToast(readableError(error), true); }
+  showLoading('正在上传分页场景', `${prepared.files.length} 个文件 · ${formatBytes(prepared.totalBytes)}`);
+  setProgress(0);
+  let scene = null;
+  try {
+    const createResponse = await fetch('/api/scenes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entry: prepared.entry })
+    });
+    if (!createResponse.ok) {
+      if (createResponse.status === 404 || createResponse.status === 501) {
+        throw new Error('当前站点未启用上传服务，请使用 frontend/deploy/run-viewer.sh 启动');
+      }
+      const payload = await createResponse.json().catch(() => ({}));
+      throw new Error(payload.error || `无法创建场景（HTTP ${createResponse.status}）`);
+    }
+    scene = await createResponse.json();
+    const loaded = new Map();
+    const updateProgress = (path, bytes) => {
+      loaded.set(path, bytes);
+      const complete = Array.from(loaded.values()).reduce((sum, value) => sum + value, 0);
+      setProgress(prepared.totalBytes ? complete / prepared.totalBytes * 100 : 100);
+    };
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(3, prepared.files.length) }, async () => {
+      while (cursor < prepared.files.length) {
+        const item = prepared.files[cursor++];
+        await uploadScenePart(`${scene.upload_base}${encodedScenePath(item.path)}`, item.file, bytes => updateProgress(item.path, bytes));
+        updateProgress(item.path, item.file.size);
+      }
+    });
+    await Promise.all(workers);
+    const sceneUrl = new URL(scene.scene_url, window.location.href).href;
+    els.streamUrl.value = sceneUrl;
+    showToast('上传完成，正在打开分页场景');
+    await loadPagedScene(sceneUrl);
+  } catch (error) {
+    if (scene?.id) fetch(`/api/scenes/${scene.id}`, { method: 'DELETE' }).catch(() => {});
+    hideLoading();
+    showToast(`场景上传失败：${readableError(error)}`, true);
+  }
+}
+
 async function loadPagedScene(value) {
   if (renderLocation !== 'paged') return;
   if (!hasWebGL2()) return showToast('当前浏览器不支持 WebGL 2', true);
@@ -996,7 +1090,7 @@ function tickFps(now) {
   requestAnimationFrame(tickFps);
 }
 
-els.openFileTop.addEventListener('click', () => renderLocation === 'paged' ? els.streamUrl.focus() : els.fileInput.click());
+els.openFileTop.addEventListener('click', () => renderLocation === 'paged' ? els.sceneFolderInput.click() : els.fileInput.click());
 els.dropzone.addEventListener('click', () => els.fileInput.click());
 els.dropzone.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') els.fileInput.click(); });
 els.fileInput.addEventListener('change', () => { handleFile(els.fileInput.files[0]); els.fileInput.value = ''; });
@@ -1008,6 +1102,10 @@ els.streamSource.addEventListener('submit', (event) => {
   event.preventDefault();
   void loadPagedScene(els.streamUrl.value);
 });
+els.selectSceneFiles.addEventListener('click', () => els.sceneFileInput.click());
+els.selectSceneFolder.addEventListener('click', () => els.sceneFolderInput.click());
+els.sceneFileInput.addEventListener('change', () => { void uploadPagedScene(els.sceneFileInput.files); els.sceneFileInput.value = ''; });
+els.sceneFolderInput.addEventListener('change', () => { void uploadPagedScene(els.sceneFolderInput.files); els.sceneFolderInput.value = ''; });
 els.togglePanel.addEventListener('click', () => setPanel(!els.modelPanel.classList.contains('visible')));
 els.closePanel.addEventListener('click', () => setPanel(false));
 els.resetView.addEventListener('click', resetView);
@@ -1043,7 +1141,13 @@ window.addEventListener('keydown', (event) => {
 window.addEventListener('dragenter', (event) => { event.preventDefault(); dragDepth++; els.dragOverlay.classList.add('visible'); });
 window.addEventListener('dragover', (event) => { event.preventDefault(); });
 window.addEventListener('dragleave', (event) => { event.preventDefault(); dragDepth--; if (dragDepth <= 0) { dragDepth = 0; els.dragOverlay.classList.remove('visible'); } });
-window.addEventListener('drop', (event) => { event.preventDefault(); dragDepth = 0; els.dragOverlay.classList.remove('visible'); handleFile(event.dataTransfer.files[0]); });
+window.addEventListener('drop', (event) => {
+  event.preventDefault();
+  dragDepth = 0;
+  els.dragOverlay.classList.remove('visible');
+  if (renderLocation === 'paged') void uploadPagedScene(event.dataTransfer.files);
+  else handleFile(event.dataTransfer.files[0]);
+});
 
 els.serverViewport.addEventListener('pointerdown', (event) => {
   if (renderLocation !== 'server' || !serverStatus) return;

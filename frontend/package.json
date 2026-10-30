@@ -9,6 +9,7 @@
     "preview": "vite preview --host 0.0.0.0",
     "test:client": "node tests/smoke.cjs",
     "test:paged": "node tests/paged-smoke.cjs",
+    "test:assets": "python3 tests/scene-server-smoke.py",
     "test:server": "node tests/server-smoke.cjs",
     "test:stream": "node tests/server-stream-smoke.cjs",
     "test:mjpeg": "node tests/server-mjpeg-fallback.cjs"
