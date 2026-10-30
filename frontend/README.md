@@ -13,7 +13,7 @@
 - 本地模式可静态部署，不需要后端和 GPU
 - Spark `.rad/.radc` 大场景支持文件、文件夹、拖放和 URL 四种入口
 - 内置场景服务支持原始文件上传与 HTTP Range，不依赖 PyTorch/GPU
-- 服务端模式支持 MJPEG 长连接、最新相机状态合并和交互式自适应 LOD
+- 服务端模式优先使用双向 WebSocket，代理不支持时回退 MJPEG，并支持最新相机状态合并和交互式自适应 LOD
 - 本地 WebGL 渲染包按需加载，服务端模式首屏更轻
 
 ## 本地运行
@@ -65,7 +65,7 @@ npm run test:server
 当前 Docker 容器创建时没有向宿主机发布 `8088`，且不能在不重建容器的情况下补加端口映射。测试时使用 SSH 本地转发：
 
 ```bash
-ssh -N -L 18088:127.0.0.1:8088 V100-tailscale-ljq
+ssh -N -L 18088:127.0.0.1:8088 A5000-tailscale-ljq
 ```
 
 然后访问 `http://127.0.0.1:18088`。正式绑定域名时，可在宿主机反向代理到容器，或在维护窗口重建容器并增加 `-p 8088:8088`；这两种操作都不属于当前无中断部署范围。
@@ -74,9 +74,11 @@ ssh -N -L 18088:127.0.0.1:8088 V100-tailscale-ljq
 
 渲染核心采用 MIT 许可的 [GaussianSplats3D](https://github.com/mkkellogg/GaussianSplats3D)，界面与应用逻辑为本项目独立实现。
 
-## 服务端渲染模式
+## 三种渲染模式
 
-页面右上角可切换“本地渲染 / 服务端渲染”。服务端模式将标准 3DGS PLY 上传到 gsplat API，由 V100 渲染 JPEG 帧；浏览器通过拖动、滚轮、背景和画质控件更新相机。拖动期间使用 preview LOD，停止后自动细化，连续状态通过一个 MJPEG 流返回。
+页面右上角可切换“本地渲染 / 大场景流式 / 服务端渲染”。大场景模式可以选择一个含有单个 `.rad` 和配套 `.radc` 分块的文件夹、选择多个文件、拖放，或填写已有场景 URL；上传后页面会自动打开场景，服务端通过 HTTP Range 按需返回分块，不要求 CUDA 或 ROCm。
+
+服务端模式将标准 3DGS PLY 上传到 gsplat API，由 PyTorch GPU 后端渲染 JPEG 帧；NVIDIA/CUDA 是稳定路径，RX 7700 XT/ROCm 是实验路径。浏览器通过拖动、滚轮、背景和画质控件更新相机，拖动期间使用 preview LOD，停止后自动细化。帧流优先走同一条双向 WebSocket，代理不支持时自动回退 MJPEG。
 
 本地测试默认端口：
 
@@ -89,5 +91,5 @@ ssh -N -L 18088:127.0.0.1:8088 V100-tailscale-ljq
 ssh -N \
   -L 18088:127.0.0.1:8088 \
   -L 18090:127.0.0.1:8090 \
-  V100-tailscale-ljq
+  A5000-tailscale-ljq
 ```
