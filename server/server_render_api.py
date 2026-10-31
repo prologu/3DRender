@@ -430,8 +430,8 @@ class RendererState:
         model = self.model
         if model is None or self.metadata is None:
             raise RuntimeError("尚未加载模型")
-        width = int(np.clip(int(request.get("width", 960)), 320, 1920))
-        height = int(np.clip(int(request.get("height", 540)), 180, 1080))
+        width = int(np.clip(int(request.get("width", 960)), 256, 1920))
+        height = int(np.clip(int(request.get("height", 540)), 144, 1080))
         yaw = float(request.get("yaw", 0.0))
         pitch = float(request.get("pitch", 0.0))
         distance = float(request.get("distance", self.metadata["camera"]["distance"]))
@@ -493,7 +493,10 @@ class RendererState:
                     selection = np.concatenate([selection, prefix_new])
                 spatial_ms = (time.perf_counter() - select_started) * 1000.0
                 lod_strategy = "spatial"
-        jpeg_quality = int(np.clip(int(request.get("jpeg_quality", 88)), 55, 95))
+        # Low-bandwidth interactive profiles deliberately use quality down to
+        # 30. Settled frames retain their 82/90 defaults, so motion is cheap
+        # without permanently reducing inspection quality.
+        jpeg_quality = int(np.clip(int(request.get("jpeg_quality", 88)), 25, 95))
         started = time.perf_counter()
         stream_index = self._take_stream()
         try:

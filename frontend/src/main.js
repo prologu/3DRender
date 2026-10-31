@@ -58,8 +58,13 @@ let serverCanvasContext = null;
 let serverSentAt = new Map();
 let serverSettleTimer = null;
 let serverMetricsTimer = null;
-let streamedFrames = 0;
-let streamFpsStartedAt = performance.now();
+let serverDisplayedAt = 0;
+let serverDisplayedFps = null;
+let serverFrameTimes = [];
+// 交互帧先走小图，停止操作后再补当前质量档的清晰帧。初始采用窄链路
+// 友好的中档，并根据 WebSocket E2E 自动升降；不减少 Gaussian 点集。
+let serverInteractiveTier = 1;
+let serverFastFrameStreak = 0;
 let serverDrag = null;
 let serverPanDrag = null;   // 右键拖动平移（screen-plane pan），与左键旋转区分
 let hybridViewer = null;
@@ -149,7 +154,14 @@ function backgroundRgb() {
   return [0, 2, 4].map((offset) => parseInt(hex.slice(offset, offset + 2), 16) / 255);
 }
 
-function serverResolution() {
+function serverResolution(interactive = false) {
+  if (interactive) {
+    const performanceMode = els.qualitySelect.value === 'performance';
+    const profiles = performanceMode
+      ? [{ width: 480, height: 270 }, { width: 400, height: 225 }, { width: 256, height: 144 }]
+      : [{ width: 640, height: 360 }, { width: 400, height: 225 }, { width: 256, height: 144 }];
+    return profiles[serverInteractiveTier];
+  }
   return els.qualitySelect.value === 'performance'
     ? { width: 800, height: 450 }
     : { width: 1280, height: 720 };
@@ -165,7 +177,7 @@ function serverRenderPayload(interactive = false) {
   const requestedLod = lodFraction();
   return {
     ...serverCamera,           // 含 yaw/pitch/distance/pan
-    ...serverResolution(),
+    ...serverResolution(interactive),
     background: backgroundRgb(),
     fov: 55,
     // 旋转前后严格使用相同点集，避免交互帧暗中降到 25%/35% 后出现结构消失。
@@ -173,7 +185,9 @@ function serverRenderPayload(interactive = false) {
     lod: requestedLod,
     lock_lod: true,
     // Motion frames favor latency/bandwidth; the settled frame restores quality.
-    jpeg_quality: interactive ? (performanceMode ? 70 : 78) : (performanceMode ? 82 : 90),
+    jpeg_quality: interactive
+      ? [performanceMode ? 50 : 58, 45, 30][serverInteractiveTier]
+      : (performanceMode ? 82 : 90),
     interactive
   };
 }
@@ -338,22 +352,51 @@ async function finishServerUpload(error, model) {
 
 function updateStreamMetrics(stats) {
   if (!stats) return;
-  const fps = stats.render_ms ? Math.round(1000 / stats.render_ms) : '—';
-  els.fpsValue.textContent = fps;
+  const renderFps = stats.render_ms ? Math.round(1000 / stats.render_ms) : null;
+  if (serverDisplayedFps == null && renderFps) els.fpsValue.textContent = renderFps;
   const lod = stats.gaussians ? ` · ${formatCount(stats.gaussians)} GS` : '';
   const latency = Number.isFinite(stats.e2e_ms) ? ` · E2E ${Math.round(stats.e2e_ms)} ms` : '';
   const dropped = stats.dropped_frames ? ` · 丢旧帧 ${stats.dropped_frames}` : '';
-  els.serverMetrics.textContent = `${stats.width}×${stats.height}${lod} · ${stats.render_ms || '—'} ms${latency}${dropped} · ${stats.peak_allocated_mib || '—'} MiB`;
+  const bytes = stats.jpeg_bytes ? ` · ${(stats.jpeg_bytes / 1024).toFixed(1)} KiB` : '';
+  const phase = stats.interactive ? '交互' : '清晰';
+  els.serverMetrics.textContent = `${phase} ${stats.width}×${stats.height}${lod} · GPU ${stats.render_ms || '—'} ms${latency}${bytes}${dropped} · ${stats.peak_allocated_mib || '—'} MiB`;
+
+  if (stats.interactive && Number.isFinite(stats.e2e_ms)) {
+    // 使用迟滞，避免链路抖动时分辨率反复跳档。这里只改变图像码率；
+    // lock_lod 仍保证旋转过程中完整使用滑杆选定的 Gaussian 点集。
+    if (stats.e2e_ms > 500) {
+      serverInteractiveTier = Math.min(2, serverInteractiveTier + 1);
+      serverFastFrameStreak = 0;
+    } else if (stats.e2e_ms < 220) {
+      serverFastFrameStreak++;
+      // 恢复画质要比降码率慢，避免 256p/640p 在抖动链路上逐帧振荡。
+      if (serverFastFrameStreak >= 6) {
+        serverInteractiveTier = Math.max(0, serverInteractiveTier - 1);
+        serverFastFrameStreak = 0;
+      }
+    } else {
+      serverFastFrameStreak = 0;
+    }
+  }
 }
 
-function recordDisplayedServerFrame() {
-  streamedFrames++;
+function recordDisplayedServerFrame(stats = null) {
   const now = performance.now();
-  if (now - streamFpsStartedAt > 700) {
-    els.fpsValue.textContent = Math.max(1, Math.round(streamedFrames * 1000 / (now - streamFpsStartedAt)));
-    streamedFrames = 0;
-    streamFpsStartedAt = now;
+  // 用三秒滑窗统计实际到达率，避免 TCP 短暂成批交付两帧时显示
+  // 20+ FPS，也避免把相机静止数秒后的单张清晰帧误报成 1 FPS。
+  if (serverDisplayedAt && now - serverDisplayedAt > 1500) serverFrameTimes = [];
+  serverFrameTimes.push(now);
+  serverFrameTimes = serverFrameTimes.filter(value => now - value <= 3000);
+  if (serverFrameTimes.length >= 2) {
+    const span = serverFrameTimes.at(-1) - serverFrameTimes[0];
+    serverDisplayedFps = (serverFrameTimes.length - 1) * 1000 / Math.max(span, 1);
+    els.fpsValue.textContent = Math.max(1, Math.round(serverDisplayedFps));
+  } else {
+    serverDisplayedFps = null;
+    const renderFps = stats?.render_ms ? Math.round(1000 / stats.render_ms) : null;
+    if (renderFps) els.fpsValue.textContent = renderFps;
   }
+  serverDisplayedAt = now;
   els.serverViewport.classList.add('ready');
   if (!serverDrag) setHybridVisible(false);
 }
@@ -396,7 +439,7 @@ async function displayWebSocketFrame(packet) {
       serverCanvasContext.drawImage(bitmap, 0, 0);
       bitmap.close();
       updateStreamMetrics(stats);
-      recordDisplayedServerFrame();
+      recordDisplayedServerFrame(stats);
     }
   } catch (error) {
     console.warn('WebSocket 帧解码失败:', error);
@@ -415,6 +458,9 @@ async function closeServerSession() {
   serverSocketRaf = null;
   serverSocketSentSeq = 0;
   serverSocketAckSeq = 0;
+  serverDisplayedAt = 0;
+  serverDisplayedFps = null;
+  serverFrameTimes = [];
   serverSentAt.clear();
   serverUpdatePending = null;
   serverSocketPending = null;
@@ -626,10 +672,11 @@ async function openServerSession() {
 function flushServerSocketUpdate() {
   serverSocketRaf = null;
   if (!serverSocketPending || !serverSocket || serverSocket.readyState !== WEBSOCKET_OPEN) return;
-  // Keep at most two unacknowledged viewpoints in flight. Frame metadata
-  // carries client_seq back as the acknowledgement, preventing a slow link
-  // from building a long queue of stale camera states behind the pointer.
-  if (serverSocketSentSeq - serverSocketAckSeq >= 2) return;
+  // Keep exactly one viewpoint in flight. On a bandwidth-limited tunnel a
+  // second revision makes the server render and then discard the first one;
+  // waiting for its frame acknowledgement lets the pending slot always hold
+  // the newest camera without wasting GPU or network work on stale views.
+  if (serverSocketSentSeq - serverSocketAckSeq >= 1) return;
   if (serverSocket.bufferedAmount > 128 * 1024) {
     serverSocketRaf = requestAnimationFrame(flushServerSocketUpdate);
     return;

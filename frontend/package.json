@@ -11,6 +11,7 @@
     "test:paged": "node tests/paged-smoke.cjs",
     "test:assets": "python3 tests/scene-server-smoke.py",
     "test:server": "node tests/server-smoke.cjs",
+    "test:server-performance": "node tests/server-performance.cjs",
     "test:stream": "node tests/server-stream-smoke.cjs",
     "test:mjpeg": "node tests/server-mjpeg-fallback.cjs"
   },

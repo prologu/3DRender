@@ -27,7 +27,9 @@ const path = require('node:path');
   await page.waitForFunction(() => {
     const image = document.querySelector('#serverFrame');
     const canvas = document.querySelector('#serverCanvas');
-    return image.naturalWidth > 0 || canvas.width > 0;
+    const viewport = document.querySelector('#serverViewport');
+    return viewport.classList.contains('ready') &&
+      (image.naturalWidth >= 640 || canvas.width >= 640);
   }, null, { timeout: 30000 });
 
   const before = await page.locator('#serverMetrics').textContent();
