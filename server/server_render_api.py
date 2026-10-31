@@ -514,6 +514,14 @@ class RendererState:
                             for name, tensor in model.items()
                         }
                     gpu_started = time.perf_counter()
+                    background_tensor = torch.tensor(
+                        background, dtype=torch.float32, device=self.device
+                    )
+                    # The current gsplat HIP branch (1.6) keeps a camera
+                    # dimension even for a single view, while the pinned CUDA
+                    # 1.5.3 wheel expects the unbatched [channels] form.
+                    if torch.version.hip:
+                        background_tensor = background_tensor[None]
                     rendered, _, _ = rasterization(
                         means=params["means"],
                         quats=params["quats"],
@@ -525,8 +533,7 @@ class RendererState:
                         width=width,
                         height=height,
                         packed=True,
-                        # gsplat 1.5.3 packed mode expects a single [channels] background.
-                        backgrounds=torch.tensor(background, dtype=torch.float32, device=self.device),
+                        backgrounds=background_tensor,
                         render_mode="RGB",
                         rasterize_mode="classic",
                     )
