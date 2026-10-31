@@ -660,6 +660,13 @@ class RenderSession:
             stats["sent_frames"] = self.sent_frames
             self.stats = stats
 
+    def mark_transport_drop(self, stats: dict) -> None:
+        """Count a rendered frame replaced by a newer unsent transport frame."""
+        with self.condition:
+            self.dropped_frames += 1
+            stats["dropped_frames"] = self.dropped_frames
+            self.stats = stats
+
     def attach_stream(self) -> bool:
         with self.condition:
             if self.stream_attached or self.closed:
@@ -1066,7 +1073,20 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
 
+        # Do not let TCP accumulate seconds of obsolete camera frames. Linux
+        # doubles SO_SNDBUF internally; this value leaves room for a few small
+        # interactive JPEGs while applying backpressure before a stale tail
+        # grows. TCP_NODELAY also avoids delayed-ACK stalls for low-byte frames.
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16 * 1024)
+        except OSError:
+            pass
+
         send_lock = threading.Lock()
+        output_condition = threading.Condition()
+        output_frame: tuple[bytes, dict] | None = None
+        output_closed = False
 
         def read_exact(length: int) -> bytes:
             chunks = bytearray()
@@ -1125,8 +1145,32 @@ class ApiHandler(BaseHTTPRequestHandler):
             finally:
                 session.close()
 
+        def send_latest_frames() -> None:
+            """Drain a one-frame mailbox; rendering never waits on slow I/O."""
+            nonlocal output_frame, output_closed
+            try:
+                while True:
+                    with output_condition:
+                        output_condition.wait_for(lambda: output_frame is not None or output_closed)
+                        if output_frame is None and output_closed:
+                            return
+                        image, stats = output_frame
+                        output_frame = None
+                    session.mark_sent(stats)
+                    stats_bytes = json.dumps(stats, separators=(",", ":")).encode("utf-8")
+                    payload = struct.pack("!I", len(stats_bytes)) + stats_bytes + image
+                    send_packet(0x2, payload)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                session.close()
+            finally:
+                with output_condition:
+                    output_closed = True
+                    output_condition.notify_all()
+
         receiver = threading.Thread(target=receive_camera_updates, daemon=True)
+        sender = threading.Thread(target=send_latest_frames, daemon=True)
         receiver.start()
+        sender.start()
         rendered_revision = 0
         try:
             while not session.closed:
@@ -1138,23 +1182,34 @@ class ApiHandler(BaseHTTPRequestHandler):
                     continue
                 image, stats = self.render_session_frame(session, request, revision)
                 rendered_revision = revision
-                if session.finish_render(revision, stats):
-                    continue
-                session.mark_sent(stats)
-                stats_bytes = json.dumps(stats, separators=(",", ":")).encode("utf-8")
-                send_packet(0x2, struct.pack("!I", len(stats_bytes)) + stats_bytes + image)
+                # A newer camera revision does not invalidate this completed
+                # image: publishing it into the one-slot mailbox gives useful
+                # motion feedback while the next revision renders. If the link
+                # is still sending, a subsequent image replaces it atomically.
+                session.finish_render(revision, stats)
+                with output_condition:
+                    if output_closed:
+                        break
+                    if output_frame is not None:
+                        session.mark_transport_drop(stats)
+                    output_frame = (image, stats)
+                    output_condition.notify()
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         except Exception as exc:
             print(f"websocket {session_id} stopped: {exc}", flush=True)
         finally:
             session.close()
+            with output_condition:
+                output_closed = True
+                output_condition.notify_all()
             session.detach_stream()
             try:
                 self.connection.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
             receiver.join(timeout=1.0)
+            sender.join(timeout=1.0)
             self.app.sessions.delete(session_id)
 
     def receive_model(self) -> None:

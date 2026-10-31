@@ -427,9 +427,6 @@ async function displayWebSocketFrame(packet) {
         for (const seq of serverSentAt.keys()) {
           if (seq <= stats.client_seq) serverSentAt.delete(seq);
         }
-        if (serverSocketPending && !serverSocketRaf) {
-          serverSocketRaf = requestAnimationFrame(flushServerSocketUpdate);
-        }
       }
       const jpeg = new Blob([buffer.slice(4 + statsLength)], { type: 'image/jpeg' });
       const bitmap = await createImageBitmap(jpeg);
@@ -677,19 +674,11 @@ async function openServerSession() {
 function flushServerSocketUpdate() {
   serverSocketRaf = null;
   if (!serverSocketPending || !serverSocket || serverSocket.readyState !== WEBSOCKET_OPEN) return;
-  // Keep a bounded bandwidth-delay-product window instead of stop-and-wait.
-  // A single in-flight frame caps FPS at 1000 / RTT (400 ms => 2.5 FPS), even
-  // when the GPU and link have ample throughput. The server coalesces camera
-  // revisions and the browser paints only the latest decoded frame, so a
-  // larger window fills the tunnel without creating an unbounded stale queue.
-  const maxInFlight = [8, 20, 32][serverInteractiveTier];
-  const outstanding = serverSocketSentSeq - serverSocketAckSeq;
-  // A settled 720p/450p frame is much larger than a motion frame. Wait for
-  // motion acknowledgements before sending it so it cannot sit behind the
-  // BDP window and report multi-second final-frame latency.
-  const allowedInFlight = serverSocketPending.interactive ? maxInFlight : 1;
-  if (outstanding >= allowedInFlight) return;
-  if (serverSocket.bufferedAmount > 128 * 1024) {
+  // Camera control is independent from image delivery. Waiting for an image
+  // ACK here makes a slow downstream connection freeze the upstream drag and
+  // leaves the renderer working on an old view. The mailbox is still one item
+  // wide, and bufferedAmount bounds only the tiny outbound control channel.
+  if (serverSocket.bufferedAmount > 16 * 1024) {
     serverSocketRaf = requestAnimationFrame(flushServerSocketUpdate);
     return;
   }
@@ -697,6 +686,8 @@ function flushServerSocketUpdate() {
   serverSocketPending = null;
   serverSocketSentSeq++;
   serverSentAt.set(serverSocketSentSeq, performance.now());
+  // A disconnected/hidden tab must not retain an unbounded timing history.
+  while (serverSentAt.size > 256) serverSentAt.delete(serverSentAt.keys().next().value);
   serverSocket.send(JSON.stringify({ ...latest, client_seq: serverSocketSentSeq }));
   if (serverSocketPending) serverSocketRaf = requestAnimationFrame(flushServerSocketUpdate);
 }
@@ -1311,6 +1302,7 @@ window.addEventListener('drop', (event) => {
 els.serverViewport.addEventListener('pointerdown', (event) => {
   if (renderLocation !== 'server' || !serverStatus) return;
   if (event.button !== 0 && event.button !== 2) return;
+  event.preventDefault();
   els.serverViewport.setPointerCapture(event.pointerId);
   if (event.button === 2) {
     // 右键：屏幕平面平移（与左键旋转区分）
@@ -1323,10 +1315,13 @@ els.serverViewport.addEventListener('pointerdown', (event) => {
 });
 els.serverViewport.addEventListener('pointermove', (event) => {
   if (renderLocation !== 'server') return;
+  if ((serverDrag || serverPanDrag) && event.cancelable) event.preventDefault();
+  const samples = event.getCoalescedEvents?.() || [event];
+  const sample = samples[samples.length - 1] || event;
   if (serverDrag && serverDrag.pointerId === event.pointerId) {
-    const dx = event.clientX - serverDrag.x;
-    const dy = event.clientY - serverDrag.y;
-    serverDrag = { x: event.clientX, y: event.clientY, pointerId: event.pointerId };
+    const dx = sample.clientX - serverDrag.x;
+    const dy = sample.clientY - serverDrag.y;
+    serverDrag = { x: sample.clientX, y: sample.clientY, pointerId: event.pointerId };
     const rot = rotationSpeed();
     serverCamera.yaw = wrapAngle(serverCamera.yaw - dx * rot);
     serverCamera.pitch = wrapAngle(serverCamera.pitch + dy * rot);
@@ -1334,9 +1329,9 @@ els.serverViewport.addEventListener('pointermove', (event) => {
     scheduleServerRender(true);
   }
   if (serverPanDrag && serverPanDrag.pointerId === event.pointerId) {
-    const dx = event.clientX - serverPanDrag.x;
-    const dy = event.clientY - serverPanDrag.y;
-    serverPanDrag = { x: event.clientX, y: event.clientY, pointerId: event.pointerId };
+    const dx = sample.clientX - serverPanDrag.x;
+    const dy = sample.clientY - serverPanDrag.y;
+    serverPanDrag = { x: sample.clientX, y: sample.clientY, pointerId: event.pointerId };
     const { right, up } = cameraMoveVectors();
     const scale = (serverCamera.distance / Math.max(els.serverViewport.clientHeight || 720, 300)) * 0.6;
     for (let i = 0; i < 3; i++) serverCamera.pan[i] += (-right[i] * dx + up[i] * dy) * scale;
@@ -1349,9 +1344,15 @@ function finishServerPointer(event) {
   const wasActive = rotating || panning;
   if (rotating) serverDrag = null;
   if (panning) serverPanDrag = null;
+  if (wasActive && els.serverViewport.hasPointerCapture?.(event.pointerId)) {
+    els.serverViewport.releasePointerCapture(event.pointerId);
+  }
   if (wasActive) scheduleServerRender(false);
 }
-els.serverViewport.addEventListener('pointerup', finishServerPointer);
+// Window-level completion covers a browser/OS releasing the pointer outside
+// the viewport even when pointer capture is interrupted by fullscreen/UI work.
+window.addEventListener('pointerup', finishServerPointer);
+window.addEventListener('pointercancel', finishServerPointer);
 els.serverViewport.addEventListener('pointercancel', finishServerPointer);
 els.serverViewport.addEventListener('lostpointercapture', finishServerPointer);
 els.serverViewport.addEventListener('contextmenu', (event) => { if (renderLocation === 'server') event.preventDefault(); });
