@@ -61,10 +61,9 @@ let serverMetricsTimer = null;
 let serverDisplayedAt = 0;
 let serverDisplayedFps = null;
 let serverFrameTimes = [];
-// 交互帧先走小图，停止操作后再补当前质量档的清晰帧。初始采用窄链路
-// 友好的中档，并根据 WebSocket E2E 自动升降；不减少 Gaussian 点集。
-let serverInteractiveTier = 1;
-let serverFastFrameStreak = 0;
+// 交互帧先走小图，停止操作后再补当前质量档的清晰帧。普通网络从
+// 640×360 探测，Tailscale 直接使用低码率档；E2E 超预算时只降不升。
+let serverInteractiveTier = 0;
 let serverDrag = null;
 let serverPanDrag = null;   // 右键拖动平移（screen-plane pan），与左键旋转区分
 let hybridViewer = null;
@@ -118,6 +117,14 @@ function defaultRenderApi() {
 }
 const API_BASE = defaultRenderApi();
 window.__lumaRenderApi = API_BASE;
+// Tailscale uses 100.64.0.0/10. On that routed path, start motion at the
+// low-bandwidth tier immediately instead of spending two RTTs probing 640p.
+try {
+  const octets = new URL(API_BASE).hostname.split('.').map(Number);
+  if (octets.length === 4 && octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127) {
+    serverInteractiveTier = 2;
+  }
+} catch (_) { /* relative/synthetic API base: keep the high-quality probe */ }
 const WEBSOCKET_OPEN = 1;
 
 function hasWebGL2() {
@@ -362,20 +369,10 @@ function updateStreamMetrics(stats) {
   els.serverMetrics.textContent = `${phase} ${stats.width}×${stats.height}${lod} · GPU ${stats.render_ms || '—'} ms${latency}${bytes}${dropped} · ${stats.peak_allocated_mib || '—'} MiB`;
 
   if (stats.interactive && Number.isFinite(stats.e2e_ms)) {
-    // 使用迟滞，避免链路抖动时分辨率反复跳档。这里只改变图像码率；
+    // E2E 超预算时单向降档，避免链路抖动时分辨率反复跳档。这里只改变图像码率；
     // lock_lod 仍保证旋转过程中完整使用滑杆选定的 Gaussian 点集。
-    if (stats.e2e_ms > 500) {
+    if (stats.e2e_ms > 450) {
       serverInteractiveTier = Math.min(2, serverInteractiveTier + 1);
-      serverFastFrameStreak = 0;
-    } else if (stats.e2e_ms < 220) {
-      serverFastFrameStreak++;
-      // 恢复画质要比降码率慢，避免 256p/640p 在抖动链路上逐帧振荡。
-      if (serverFastFrameStreak >= 6) {
-        serverInteractiveTier = Math.max(0, serverInteractiveTier - 1);
-        serverFastFrameStreak = 0;
-      }
-    } else {
-      serverFastFrameStreak = 0;
     }
   }
 }
@@ -672,11 +669,18 @@ async function openServerSession() {
 function flushServerSocketUpdate() {
   serverSocketRaf = null;
   if (!serverSocketPending || !serverSocket || serverSocket.readyState !== WEBSOCKET_OPEN) return;
-  // Keep exactly one viewpoint in flight. On a bandwidth-limited tunnel a
-  // second revision makes the server render and then discard the first one;
-  // waiting for its frame acknowledgement lets the pending slot always hold
-  // the newest camera without wasting GPU or network work on stale views.
-  if (serverSocketSentSeq - serverSocketAckSeq >= 1) return;
+  // Keep a bounded bandwidth-delay-product window instead of stop-and-wait.
+  // A single in-flight frame caps FPS at 1000 / RTT (400 ms => 2.5 FPS), even
+  // when the GPU and link have ample throughput. The server coalesces camera
+  // revisions and the browser paints only the latest decoded frame, so a
+  // larger window fills the tunnel without creating an unbounded stale queue.
+  const maxInFlight = [8, 20, 32][serverInteractiveTier];
+  const outstanding = serverSocketSentSeq - serverSocketAckSeq;
+  // A settled 720p/450p frame is much larger than a motion frame. Wait for
+  // motion acknowledgements before sending it so it cannot sit behind the
+  // BDP window and report multi-second final-frame latency.
+  const allowedInFlight = serverSocketPending.interactive ? maxInFlight : 1;
+  if (outstanding >= allowedInFlight) return;
   if (serverSocket.bufferedAmount > 128 * 1024) {
     serverSocketRaf = requestAnimationFrame(flushServerSocketUpdate);
     return;

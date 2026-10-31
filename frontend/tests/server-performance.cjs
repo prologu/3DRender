@@ -53,8 +53,9 @@ const { chromium } = require('playwright-core');
   const endedAt = performance.now();
   await page.waitForTimeout(500);
 
-  const activeFrames = receivedAt.filter(value => value >= startedAt && value <= endedAt).length;
-  const intervals = receivedAt.slice(1).map((value, index) => value - receivedAt[index]);
+  const activeReceived = receivedAt.filter(value => value >= startedAt && value <= endedAt);
+  const activeFrames = activeReceived.length;
+  const intervals = activeReceived.slice(1).map((value, index) => value - activeReceived[index]);
   const result = {
     duration_ms: Math.round(endedAt - startedAt),
     pointer_target: targetAtStart,
@@ -70,8 +71,11 @@ const { chromium } = require('playwright-core');
   console.log(JSON.stringify(result, null, 2));
   await browser.close();
 
-  const minimum = Number(process.env.MIN_STREAM_FPS || 0);
-  if (errors.length || result.delivered_fps < minimum) process.exit(1);
+  const minimum = Number(process.env.MIN_STREAM_FPS ?? 20);
+  if (errors.length || result.delivered_fps < minimum) {
+    console.error(`server stream regression: ${result.delivered_fps} FPS < ${minimum} FPS`);
+    process.exit(1);
+  }
 })().catch(error => {
   console.error(error);
   process.exit(1);
