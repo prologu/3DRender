@@ -2,7 +2,8 @@ const { chromium } = require('playwright-core');
 
 (async () => {
   const baseUrl = process.env.VIEWER_URL || 'http://127.0.0.1:18091';
-  const sessionsBefore = (await (await fetch(`${baseUrl}/api/status`)).json()).sessions.active;
+  const renderApi = process.env.RENDER_API || baseUrl;
+  const sessionsBefore = (await (await fetch(`${renderApi}/api/status`)).json()).sessions.active;
   const browser = await chromium.launch({
     headless: true,
     executablePath: process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
@@ -11,9 +12,10 @@ const { chromium } = require('playwright-core');
   const errors = [];
   page.on('console', message => { if (message.type() === 'error') errors.push(`console: ${message.text()}`); });
   page.on('pageerror', error => errors.push(`page: ${error.message}`));
-  await page.addInitScript(() => {
+  await page.addInitScript(value => {
+    window.LUMA_RENDER_API = value;
     Object.defineProperty(window, 'WebSocket', { configurable: true, value: undefined });
-  });
+  }, renderApi);
 
   await page.goto(baseUrl, { waitUntil: 'networkidle' });
   await page.locator('#serverMode').click();
@@ -39,7 +41,7 @@ const { chromium } = require('playwright-core');
   let sessionsAfter = Number.POSITIVE_INFINITY;
   for (let attempt = 0; attempt < 30; attempt++) {
     await new Promise(resolve => setTimeout(resolve, 100));
-    sessionsAfter = (await (await fetch(`${baseUrl}/api/status`)).json()).sessions.active;
+      sessionsAfter = (await (await fetch(`${renderApi}/api/status`)).json()).sessions.active;
     if (sessionsAfter <= sessionsBefore) break;
   }
   result.sessionsBefore = sessionsBefore;

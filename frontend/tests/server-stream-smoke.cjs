@@ -25,7 +25,7 @@ const median = values => {
     const payload = event.payload;
     if (!Buffer.isBuffer(payload) || payload.length < 5) return;
     const statsLength = payload.readUInt32BE(0);
-    if (statsLength < 1 || statsLength + 4 >= payload.length) return;
+    if (statsLength < 1 || statsLength + 4 > payload.length) return;
     try {
       frameStats.push(JSON.parse(payload.subarray(4, 4 + statsLength).toString('utf8')));
     } catch (_) { /* malformed packets are covered by the browser error assertions */ }
@@ -58,6 +58,8 @@ const median = values => {
   await page.waitForFunction(label => document.querySelector('#serverMetrics').textContent.includes(label), expectedLabel, { timeout: 30000 });
 
   const box = await page.locator('#serverViewport').boundingBox();
+  const videoFramesAtStart = await page.evaluate(() =>
+    document.querySelector('#serverVideo')?.getVideoPlaybackQuality?.().totalVideoFrames || 0);
   await page.evaluate(() => { window.__streamDraws = []; });
   frameStats = [];
   await page.mouse.move(box.x + box.width * 0.25, box.y + box.height * 0.55);
@@ -70,24 +72,29 @@ const median = values => {
     );
     await page.waitForTimeout(8);
   }
-  await page.waitForFunction(() => window.__streamDraws.length > 0, null, { timeout: 10000 });
+  await page.waitForFunction(start =>
+    (document.querySelector('#serverVideo')?.getVideoPlaybackQuality?.().totalVideoFrames || 0) > start,
+  videoFramesAtStart, { timeout: 10000 });
   const releasedAt = await page.evaluate(() => performance.now());
   await page.mouse.up();
   await page.waitForFunction(started => window.__streamDraws.some(frame => frame.at >= started), releasedAt, { timeout: 10000 });
 
-  const result = await page.evaluate(started => {
+  const result = await page.evaluate(({ started, videoStart }) => {
     const draws = window.__streamDraws;
     const final = draws.find(frame => frame.at >= started);
+    const video = document.querySelector('#serverVideo');
     return {
-      transport: document.querySelector('#serverViewport').classList.contains('websocket') ? 'websocket' : 'mjpeg',
+      transport: video?.srcObject ? 'webrtc'
+        : (document.querySelector('#serverViewport').classList.contains('websocket') ? 'websocket' : 'mjpeg'),
       displayedFrames: draws.length,
-      interactiveFrames: draws.filter(frame => frame.at < started).length,
+      interactiveFrames: Math.max(0,
+        (video?.getVideoPlaybackQuality?.().totalVideoFrames || 0) - videoStart),
       finalFrameLatencyMs: final ? Number((final.at - started).toFixed(1)) : null,
       finalWidth: document.querySelector('#serverCanvas').width,
       metrics: document.querySelector('#serverMetrics').textContent,
       drawTimes: draws.map(frame => frame.at)
     };
-  }, releasedAt);
+  }, { started: releasedAt, videoStart: videoFramesAtStart });
   const intervals = result.drawTimes.slice(1).map((time, index) => time - result.drawTimes[index]);
   result.medianDisplayIntervalMs = Number(median(intervals)?.toFixed(1));
   result.websocketFrames = websocketFrames;
@@ -98,6 +105,8 @@ const median = values => {
     ? [Math.min(...interactiveStats.map(stats => stats.gaussians)), Math.max(...interactiveStats.map(stats => stats.gaussians))]
     : [];
   result.expectedGaussians = expectedGaussians;
+  result.expectedInteractiveGaussians = Math.min(
+    expectedGaussians, quality === 'high' ? 550000 : 300000);
   result.lodPercent = lodPercent;
   result.quality = quality;
   result.errors = errors;
@@ -105,10 +114,11 @@ const median = values => {
   console.log(JSON.stringify(result, null, 2));
   await browser.close();
 
-  if (result.transport !== 'websocket' || result.interactiveFrames < 1 || result.interactiveStats < 1 ||
+  if (!['webrtc', 'websocket'].includes(result.transport) || result.interactiveFrames < 1 || result.interactiveStats < 1 ||
       result.finalWidth !== expectedWidth || result.finalFrameLatencyMs == null ||
-      result.finalFrameLatencyMs > 5000 || result.interactiveWidths.some(width => width !== expectedWidth) ||
-      result.interactiveGaussianRange.some(count => count !== expectedGaussians) || errors.length) process.exit(1);
+      result.finalFrameLatencyMs > 5000 || result.interactiveWidths.some(width => width > 640) ||
+      result.interactiveGaussianRange.some(count => count !== result.expectedInteractiveGaussians) ||
+      errors.length) process.exit(1);
 })().catch(error => {
   console.error(error);
   process.exit(1);

@@ -23,6 +23,17 @@ New-Item -ItemType Directory -Force -Path $WheelDir | Out-Null
     -i https://pypi.tuna.tsinghua.edu.cn/simple
 if ($LASTEXITCODE -ne 0) { throw "Python dependency download failed" }
 
+& $Python -m pip download `
+    --dest $WheelDir `
+    --only-binary=:all: `
+    --platform manylinux2014_x86_64 `
+    --python-version 310 `
+    --implementation cp `
+    --abi cp310 `
+    -r (Join-Path $AppRoot "requirements-video.txt") `
+    -i https://pypi.tuna.tsinghua.edu.cn/simple
+if ($LASTEXITCODE -ne 0) { throw "WebRTC dependency download failed" }
+
 $Downloads = @{
     "torch-2.0.1+cu118-cp310-cp310-linux_x86_64.whl" = "https://mirror.sjtu.edu.cn/pytorch-wheels/cu118/torch-2.0.1%2Bcu118-cp310-cp310-linux_x86_64.whl"
     "gsplat-1.5.3+pt20cu118-cp310-cp310-linux_x86_64.whl" = "https://github.com/nerfstudio-project/gsplat/releases/download/v1.5.3/gsplat-1.5.3%2Bpt20cu118-cp310-cp310-linux_x86_64.whl"

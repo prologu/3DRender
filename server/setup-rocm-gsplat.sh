@@ -131,6 +131,7 @@ if [[ -d /usr/lib/gcc/x86_64-linux-gnu/13 ]]; then
 fi
 
 python -m pip install ninja jaxtyping nvtx
+python -m pip install --only-binary=:all: -r "$APP_ROOT/requirements-video.txt"
 python -m pip install --no-build-isolation --no-deps --force-reinstall "$GSPLAT_SRC"
 python - <<'PY'
 import torch

@@ -20,6 +20,15 @@ python3 -m pip download \
   --no-deps \
   -r "$APP_ROOT/requirements-cu118.txt" \
   -i "$TUNA"
+python3 -m pip download \
+  --dest "$WHEEL_DIR" \
+  --only-binary=:all: \
+  --platform manylinux2014_x86_64 \
+  --python-version 310 \
+  --implementation cp \
+  --abi cp310 \
+  -r "$APP_ROOT/requirements-video.txt" \
+  -i "$TUNA"
 
 download() {
   local url="$1"

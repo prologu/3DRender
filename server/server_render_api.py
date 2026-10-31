@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import gc
 import hashlib
@@ -19,6 +20,7 @@ import subprocess
 import threading
 import time
 import uuid
+from fractions import Fraction
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -29,6 +31,15 @@ import numpy as np
 import torch
 from PIL import Image
 from gsplat import rasterization
+
+try:
+    import av
+except ImportError:
+    av = None
+try:
+    from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+except ImportError:
+    RTCPeerConnection = RTCSessionDescription = VideoStreamTrack = None
 # JPEG 编码后端：Pillow 默认（实测比 cv2.imencode 快约 1.6 倍）；
 # 个别构建上 OpenCV 更快的机器可设 LUMA_JPEG_BACKEND=opencv 切换。
 try:
@@ -52,6 +63,195 @@ def encode_jpeg(pixels: np.ndarray, quality: int) -> bytes:
     buffer = BytesIO()
     Image.fromarray(pixels, "RGB").save(buffer, format="JPEG", quality=quality, optimize=False)
     return buffer.getvalue()
+
+
+class FragmentedH264Encoder:
+    """Low-latency H.264 + fragmented MP4 stream for browser MediaSource."""
+
+    def __init__(self, width: int, height: int, generation: int):
+        if av is None:
+            raise RuntimeError("H.264 编码需要 PyAV")
+        self.width = width
+        self.height = height
+        self.generation = generation
+        self.frame_index = 0
+        self.pending_stats: dict | None = None
+        self.buffer = BytesIO()
+        self.position = 0
+        self.container = av.open(
+            self.buffer, mode="w", format="mp4",
+            options={
+                "movflags": "frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
+                "frag_duration": "33333",
+                "flush_packets": "1",
+            },
+        )
+        self.stream = self.container.add_stream("libx264", rate=30)
+        self.stream.width = width
+        self.stream.height = height
+        self.stream.pix_fmt = "yuv420p"
+        # Keep the lowest-bandwidth profile below the measured Tailscale
+        # ceiling while allowing larger LAN profiles proportionally more bits.
+        self.stream.bit_rate = max(160_000, int(width * height * 4.5))
+        self.stream.codec_context.gop_size = 30
+        self.stream.codec_context.max_b_frames = 0
+        self.stream.codec_context.time_base = Fraction(1, 30)
+        self.stream.codec_context.options = {
+            "preset": "ultrafast",
+            "tune": "zerolatency",
+        }
+        self.codec = "avc1.42C00D"
+
+    def encode(self, pixels: np.ndarray, stats: dict) -> tuple[bytes, dict]:
+        started = time.perf_counter()
+        frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(pixels), format="rgb24")
+        frame.pts = self.frame_index
+        self.frame_index += 1
+        for packet in self.stream.encode(frame):
+            self.container.mux(packet)
+        value = self.buffer.getvalue()
+        fragment = value[self.position:]
+        self.position = len(value)
+
+        # The first write is ftyp+moov. avcC carries the exact RFC 6381
+        # profile/compatibility/level triplet required by MediaSource.
+        marker = fragment.find(b"avcC")
+        if marker >= 0 and len(fragment) >= marker + 8:
+            self.codec = "avc1." + fragment[marker + 5:marker + 8].hex().upper()
+
+        encode_ms = (time.perf_counter() - started) * 1000.0
+        if self.pending_stats is None:
+            output_stats = dict(stats)
+            output_stats["encoding"] = "fmp4-init"
+        else:
+            output_stats = self.pending_stats
+            output_stats["encoding"] = "fmp4"
+        self.pending_stats = dict(stats)
+        output_stats.update({
+            "video_codec": self.codec,
+            "video_generation": self.generation,
+            "video_bytes": len(fragment),
+            "encode_ms": round(encode_ms, 2),
+        })
+        return fragment, output_stats
+
+    def close(self) -> None:
+        try:
+            self.container.close()
+        except Exception:
+            pass
+
+
+if VideoStreamTrack is not None:
+    class LatestVideoTrack(VideoStreamTrack):
+        """WebRTC track whose mailbox always contains the newest GPU frame."""
+
+        kind = "video"
+
+        def __init__(self):
+            super().__init__()
+            self.loop = asyncio.get_running_loop()
+            self.event = asyncio.Event()
+            self.latest: np.ndarray | None = None
+
+        def submit(self, pixels: np.ndarray) -> None:
+            def replace() -> None:
+                self.latest = pixels
+                self.event.set()
+            self.loop.call_soon_threadsafe(replace)
+
+        async def recv(self):
+            while self.latest is None:
+                self.event.clear()
+                if self.latest is None:
+                    await self.event.wait()
+            pixels = self.latest
+            self.latest = None
+            pts, time_base = await self.next_timestamp()
+            frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(pixels), format="rgb24")
+            frame.pts = pts
+            frame.time_base = time_base
+            return frame
+
+
+class WebRTCManager:
+    """Own aiortc objects on one asyncio loop while the API remains threaded."""
+
+    def __init__(self):
+        self.enabled = RTCPeerConnection is not None and av is not None
+        self.loop = asyncio.new_event_loop() if self.enabled else None
+        self.ready = threading.Event()
+        self.lock = threading.RLock()
+        self.peers: dict[str, tuple[object, object]] = {}
+        if self.enabled:
+            threading.Thread(target=self._run, daemon=True, name="luma-webrtc").start()
+            self.ready.wait(timeout=5)
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        self.ready.set()
+        self.loop.run_forever()
+
+    async def _offer(self, session_id: str, sdp: str, description_type: str) -> dict:
+        old = None
+        with self.lock:
+            old = self.peers.pop(session_id, None)
+        if old:
+            await old[0].close()
+        pc = RTCPeerConnection()
+        track = LatestVideoTrack()
+        pc.addTrack(track)
+
+        @pc.on("connectionstatechange")
+        async def connectionstatechange():
+            if pc.connectionState in {"failed", "closed"}:
+                with self.lock:
+                    current = self.peers.get(session_id)
+                    if current and current[0] is pc:
+                        self.peers.pop(session_id, None)
+                await pc.close()
+
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type=description_type))
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        with self.lock:
+            self.peers[session_id] = (pc, track)
+        # Chrome can prefer Tailscale's ULA IPv6 candidate even when that route
+        # has far higher RTT / loss than the peer's working 100.x IPv4 route.
+        # Keep all IPv4 candidates (LAN and tailnet) so ICE can still choose the
+        # fastest one, but omit IPv6 host candidates from the answer. This is
+        # especially important for interactive RTP, where the bad route makes
+        # congestion control collapse to tens of kilobits per second.
+        answer_sdp = "\r\n".join(
+            line for line in pc.localDescription.sdp.splitlines()
+            if not (line.startswith("a=candidate:") and ":" in line.split()[4])
+        ) + "\r\n"
+        return {"sdp": answer_sdp, "type": pc.localDescription.type}
+
+    def offer(self, session_id: str, sdp: str, description_type: str) -> dict:
+        if not self.enabled:
+            raise RuntimeError("WebRTC 运行库不可用")
+        future = asyncio.run_coroutine_threadsafe(
+            self._offer(session_id, sdp, description_type), self.loop)
+        return future.result(timeout=20)
+
+    def has(self, session_id: str) -> bool:
+        with self.lock:
+            return session_id in self.peers
+
+    def submit(self, session_id: str, pixels: np.ndarray) -> bool:
+        with self.lock:
+            item = self.peers.get(session_id)
+        if not item:
+            return False
+        item[1].submit(pixels)
+        return True
+
+    def close(self, session_id: str) -> None:
+        with self.lock:
+            item = self.peers.pop(session_id, None)
+        if item and self.enabled:
+            asyncio.run_coroutine_threadsafe(item[0].close(), self.loop)
 
 
 SH_C0 = 0.28209479177387814
@@ -330,6 +530,8 @@ class RendererState:
                 "adaptive_lod": True,
                 "mjpeg_stream": True,
                 "websocket_stream": True,
+                "h264_fmp4": av is not None,
+                "webrtc_stream": RTCPeerConnection is not None,
                 "latest_camera_wins": True,
                 "spatial_lod": bool(self.spatial_lod and self.spatial is not None),
                 "stream_concurrency": len(self.streams),
@@ -426,7 +628,7 @@ class RendererState:
         view[:3, 3] = -rotation @ eye
         return view
 
-    def render(self, request: dict) -> tuple[bytes, dict]:
+    def render(self, request: dict, return_pixels: bool = False) -> tuple[bytes | np.ndarray, dict]:
         model = self.model
         if model is None or self.metadata is None:
             raise RuntimeError("尚未加载模型")
@@ -550,7 +752,7 @@ class RendererState:
             self._release_stream(stream_index)
 
         encode_started = time.perf_counter()
-        image_bytes = encode_jpeg(pixels, jpeg_quality)
+        image_bytes = None if return_pixels else encode_jpeg(pixels, jpeg_quality)
         encode_ms = (time.perf_counter() - encode_started) * 1000.0
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         stats = {
@@ -563,13 +765,13 @@ class RendererState:
             "lod": lod_name,
             "lod_strategy": lod_strategy,
             "spatial_ms": round(spatial_ms, 2),
-            "jpeg_bytes": len(image_bytes),
-            "jpeg_backend": _JPEG_BACKEND,
+            "jpeg_bytes": len(image_bytes) if image_bytes is not None else 0,
+            "jpeg_backend": _JPEG_BACKEND if image_bytes is not None else None,
             "peak_allocated_mib": round(torch.cuda.max_memory_allocated(self.device) / 2**20, 1),
             "peak_reserved_mib": round(torch.cuda.max_memory_reserved(self.device) / 2**20, 1),
             "yaw": yaw, "pitch": pitch, "distance": distance,
         }
-        return image_bytes, stats
+        return (pixels if return_pixels else image_bytes), stats
 
     def export_splat(self, count: int) -> bytes:
         """Export importance-top-N Gaussians as a 32-byte-per-splat .splat preview."""
@@ -888,7 +1090,25 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "session": session.id,
                     "stream_url": f"/api/session/{session.id}/stream",
                     "websocket_url": f"/api/session/{session.id}/ws",
+                    "webrtc_url": f"/api/session/{session.id}/webrtc",
                 })
+            elif path.startswith("/api/session/") and path.endswith("/webrtc"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    raise ValueError("WebRTC 会话路径无效")
+                session = self.app.sessions.get(parts[2])
+                offer = self.read_json_request()
+                if not isinstance(offer.get("sdp"), str) or offer.get("type") != "offer":
+                    raise ValueError("WebRTC offer 无效")
+                answer = self.app.webrtc.offer(session.id, offer["sdp"], offer["type"])
+                self.send_json(HTTPStatus.OK, answer)
+            elif path.startswith("/api/session/") and path.endswith("/close"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    raise ValueError("渲染会话路径无效")
+                self.app.webrtc.close(parts[2])
+                self.app.sessions.delete(parts[2])
+                self.send_json(HTTPStatus.OK, {"ok": True})
             elif path.startswith("/api/session/") and path.endswith("/camera"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 4:
@@ -913,6 +1133,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
         if len(parts) == 3 and parts[:2] == ["api", "session"]:
+            self.app.webrtc.close(parts[2])
             self.app.sessions.delete(parts[2])
             self.send_json(HTTPStatus.OK, {"ok": True})
         else:
@@ -928,8 +1149,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         return payload
 
     def render_session_frame(
-        self, session: RenderSession, request: dict, revision: int
-    ) -> tuple[bytes, dict]:
+        self, session: RenderSession, request: dict, revision: int,
+        raw_video: bool = False,
+    ) -> tuple[bytes | np.ndarray, dict]:
         """Render one coalesced session revision and update adaptive LOD state."""
         active_request = request
         ceiling = self.app.state.lod_fraction(request.get("lod", "full"))
@@ -950,7 +1172,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             # orbiting never makes geometry disappear merely to chase FPS.
             session.auto_fraction = ceiling
 
-        image, stats = self.app.state.render(active_request)
+        image, stats = self.app.state.render(active_request, return_pixels=raw_video)
         session.last_rt = stats["render_ms"]
         if self.app.auto_lod and not lock_lod:
             session.auto_frames += 1
@@ -1085,7 +1307,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         send_lock = threading.Lock()
         output_condition = threading.Condition()
-        output_frame: tuple[bytes, dict] | None = None
+        output_frame: tuple[bytes | np.ndarray, dict, str] | None = None
         output_closed = False
 
         def read_exact(length: int) -> bytes:
@@ -1148,14 +1370,40 @@ class ApiHandler(BaseHTTPRequestHandler):
         def send_latest_frames() -> None:
             """Drain a one-frame mailbox; rendering never waits on slow I/O."""
             nonlocal output_frame, output_closed
+            video_encoder: FragmentedH264Encoder | None = None
+            video_generation = 0
             try:
                 while True:
                     with output_condition:
                         output_condition.wait_for(lambda: output_frame is not None or output_closed)
                         if output_frame is None and output_closed:
                             return
-                        image, stats = output_frame
+                        image, stats, transport = output_frame
                         output_frame = None
+                    if transport == "h264-fmp4":
+                        height, width = image.shape[:2]
+                        if (video_encoder is None or video_encoder.width != width
+                                or video_encoder.height != height
+                                or video_encoder.frame_index >= 300):
+                            if video_encoder is not None:
+                                video_encoder.close()
+                            video_generation += 1
+                            video_encoder = FragmentedH264Encoder(width, height, video_generation)
+                        image, stats = video_encoder.encode(image, stats)
+                        if not image:
+                            continue
+                    elif video_encoder is not None:
+                        # A still JPEG is an explicit stream boundary. Reopen
+                        # H.264 on the next drag so it starts with fresh init
+                        # metadata and an independent keyframe.
+                        video_encoder.close()
+                        video_encoder = None
+                    if transport == "webrtc":
+                        if not self.app.webrtc.submit(session.id, image):
+                            continue
+                        stats["encoding"] = "webrtc"
+                        stats["video_bytes"] = 0
+                        image = b""
                     session.mark_sent(stats)
                     stats_bytes = json.dumps(stats, separators=(",", ":")).encode("utf-8")
                     payload = struct.pack("!I", len(stats_bytes)) + stats_bytes + image
@@ -1163,6 +1411,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, OSError):
                 session.close()
             finally:
+                if video_encoder is not None:
+                    video_encoder.close()
                 with output_condition:
                     output_closed = True
                     output_condition.notify_all()
@@ -1180,7 +1430,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 request, revision = item
                 if revision <= rendered_revision:
                     continue
-                image, stats = self.render_session_frame(session, request, revision)
+                requested_transport = request.get("video_transport")
+                transport = "jpeg"
+                if request.get("interactive") is True:
+                    if requested_transport == "webrtc" and self.app.webrtc.has(session.id):
+                        transport = "webrtc"
+                    elif requested_transport == "h264-fmp4" and av is not None:
+                        transport = "h264-fmp4"
+                wants_video = transport != "jpeg"
+                image, stats = self.render_session_frame(
+                    session, request, revision, raw_video=wants_video)
                 rendered_revision = revision
                 # A newer camera revision does not invalidate this completed
                 # image: publishing it into the one-slot mailbox gives useful
@@ -1192,7 +1451,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                         break
                     if output_frame is not None:
                         session.mark_transport_drop(stats)
-                    output_frame = (image, stats)
+                    output_frame = (image, stats, transport)
                     output_condition.notify()
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
@@ -1210,6 +1469,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 pass
             receiver.join(timeout=1.0)
             sender.join(timeout=1.0)
+            self.app.webrtc.close(session_id)
             self.app.sessions.delete(session_id)
 
     def receive_model(self) -> None:
@@ -1252,6 +1512,7 @@ class RenderServer(ThreadingHTTPServer):
         self.upload_dir = upload_dir
         self.max_upload_bytes = max_upload_bytes
         self.sessions = SessionRegistry(max_sessions, session_ttl)
+        self.webrtc = WebRTCManager()
         self.site_dir = site_dir.resolve() if site_dir is not None else None
         self.auto_lod = auto_lod
         self.frame_budget_ms = frame_budget_ms

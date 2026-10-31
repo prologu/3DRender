@@ -11,8 +11,10 @@ flowchart LR
     UI -->|"相机状态"| S["会话 API"]
     S --> C["latest-camera 合并"]
     C --> G["gsplat / CUDA"]
-    G --> J["Pillow JPEG 编码"]
-    J -->|"WebSocket JPEG（首选） / MJPEG（降级）"| UI
+    G --> V["PyAV / libx264"]
+    V -->|"WebRTC H.264（首选）"| UI
+    G --> J["H.264/fMP4 或 JPEG 降级"]
+    J -->|"WebSocket / MJPEG"| UI
     UI -->|"PLY 分块上传"| P["磁盘文件 + 校验"]
     P --> M["CPU 解析 / 稳定 LOD 排序"]
     M --> G
@@ -22,7 +24,7 @@ flowchart LR
 
 ## 服务端帧流
 
-客户端创建 `/api/session` 后优先升级到双向 WebSocket：文本消息发送相机状态，二进制消息接收 `stats + JPEG`。相机消息带递增 `client_seq`，服务端随渲染帧确认；浏览器最多保留 2 个未确认视角，待发状态始终覆盖为最新值。这样既避免逐请求 RTT，又避免有序 TCP 中积压过期视角。WebSocket 不可用时回退到 `multipart/x-mixed-replace` MJPEG，并通过 POST 更新相机。
+客户端创建 `/api/session` 后先建立 WebRTC H.264 接收轨，再升级双向 WebSocket：文本消息发送相机状态，二进制消息接收轻量统计。WebRTC 不可用时依次使用 H.264/fMP4 WebSocket、JPEG WebSocket 和 `multipart/x-mixed-replace` MJPEG。相机消息带递增 `client_seq`，待发状态始终覆盖为最新值，图像与控制不再共享同一条有序 TCP 数据流。
 
 两种协议都只领取最新 revision。GPU 调用本身不能中途取消，但返回后会在发送前再次比较当前 revision：过期结果计入 `dropped_frames`，不会进入 TCP、JPEG 解码或 Canvas。交互请求降低 JPEG 质量以减小传输，停止后补一张高质量帧。浏览器用 `client_seq` 的发送时间与帧确认计算 E2E 时延。MJPEG 在停止后仅补发一次已编码帧以提交 Chromium 缓冲，并探测空闲 socket 断开；WebSocket 不需要重复帧。默认最多 4 个会话、120 秒无流连接自动回收。各渲染调用从 CUDA stream 池取独立 stream，只有模型加载/更换持有全局互斥。
 
@@ -70,8 +72,10 @@ flowchart LR
 | POST | `/api/model` | 原始请求体上传标准 PLY |
 | POST | `/api/render` | 单次 JPEG 渲染，兼容与高清截图 |
 | POST | `/api/session` | 创建交互会话并提交初始相机 |
-| GET | `/api/session/{id}/ws` | 双向 WebSocket 相机控制与 JPEG 帧流 |
+| POST | `/api/session/{id}/webrtc` | SDP offer/answer，建立 H.264 视频轨 |
+| GET | `/api/session/{id}/ws` | 双向 WebSocket 相机控制与统计；也承载视频降级流 |
 | POST | `/api/session/{id}/camera` | 更新最新相机、分辨率和 LOD |
 | GET | `/api/session/{id}/stream` | MJPEG 帧流 |
 | GET | `/api/session/{id}` | 最近一帧指标 |
 | DELETE | `/api/session/{id}` | 主动释放会话 |
+| POST | `/api/session/{id}/close` | pagehide/sendBeacon 无预检释放会话 |

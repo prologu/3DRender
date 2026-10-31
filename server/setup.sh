@@ -12,6 +12,7 @@ LOCAL_TORCH_WHEEL="$WHEEL_DIR/$TORCH_FILENAME"
 LOCAL_GSPLAT_WHEEL="$WHEEL_DIR/$GSPLAT_FILENAME"
 GSPLAT_WHEEL_URL="https://github.com/nerfstudio-project/gsplat/releases/download/v1.5.3/gsplat-1.5.3%2Bpt20cu118-cp310-cp310-linux_x86_64.whl"
 REQUIREMENTS="$APP_ROOT/requirements-cu118.txt"
+VIDEO_REQUIREMENTS="$APP_ROOT/requirements-video.txt"
 
 PYTHON_ABI="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
 if [[ "$PYTHON_ABI" != "3.10" ]]; then
@@ -33,12 +34,16 @@ if [[ "${OFFLINE:-0}" == "1" ]]; then
   done
   python3 -m pip install --upgrade --target "$DEPS" --no-deps \
     --no-index --find-links "$WHEEL_DIR" -r "$REQUIREMENTS"
+  python3 -m pip install --upgrade --target "$DEPS" \
+    --no-index --find-links "$WHEEL_DIR" -r "$VIDEO_REQUIREMENTS"
   python3 -m pip install --upgrade --target "$DEPS" "$LOCAL_TORCH_WHEEL" --no-deps
   python3 -m pip install --upgrade --target "$DEPS" "$LOCAL_GSPLAT_WHEEL" --no-deps
 else
   python3 -m pip install --upgrade --target "$DEPS" pip setuptools wheel -i "$TUNA"
   python3 -m pip install --upgrade --target "$DEPS" "$TORCH_WHEEL" --no-deps
   python3 -m pip install --upgrade --target "$DEPS" --no-deps -r "$REQUIREMENTS" -i "$TUNA"
+  python3 -m pip install --upgrade --target "$DEPS" --only-binary=:all: \
+    -r "$VIDEO_REQUIREMENTS" -i "$TUNA"
   if [[ -f "$LOCAL_GSPLAT_WHEEL" ]]; then
     python3 -m pip install --upgrade --target "$DEPS" "$LOCAL_GSPLAT_WHEEL" --no-deps
   else

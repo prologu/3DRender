@@ -10,6 +10,9 @@ const { chromium } = require('playwright-core');
   });
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   if (renderApi) await page.addInitScript(value => { window.LUMA_RENDER_API = value; }, renderApi);
+  if (process.env.DISABLE_VIDEO === '1') {
+    await page.addInitScript(() => { window.LUMA_DISABLE_VIDEO = true; });
+  }
 
   const receivedAt = [];
   const sentAt = [];
@@ -26,6 +29,13 @@ const { chromium } = require('playwright-core');
 
   await page.goto(baseUrl, { waitUntil: 'networkidle' });
   await page.locator('#serverMode').click();
+  if (process.env.LOD_PERCENT) {
+    await page.locator('#lodSlider').evaluate((node, value) => {
+      node.value = value;
+      node.dispatchEvent(new Event('input', { bubbles: true }));
+      node.dispatchEvent(new Event('change', { bubbles: true }));
+    }, process.env.LOD_PERCENT);
+  }
   await page.waitForFunction(() => {
     const viewport = document.querySelector('#serverViewport');
     const canvas = document.querySelector('#serverCanvas');
@@ -33,6 +43,8 @@ const { chromium } = require('playwright-core');
       canvas.width >= 640 && document.querySelector('#welcome').classList.contains('hidden');
   }, null, { timeout: 30000 });
   const box = await page.locator('#serverViewport').boundingBox();
+  const videoFramesAtStart = await page.evaluate(() =>
+    document.querySelector('#serverVideo')?.getVideoPlaybackQuality?.().totalVideoFrames || 0);
   const startedAt = performance.now();
   const targetAtStart = await page.evaluate(({ x, y }) => {
     const node = document.elementFromPoint(x, y);
@@ -49,9 +61,37 @@ const { chromium } = require('playwright-core');
     );
     await page.waitForTimeout(16);
   }
+  const videoDuringDrag = await page.evaluate(() => {
+    const video = document.querySelector('#serverVideo');
+    return {
+      active: document.querySelector('#serverViewport').classList.contains('video-stream'),
+      readyState: video?.readyState ?? -1,
+      currentTime: Number((video?.currentTime || 0).toFixed(3)),
+      bufferedEnd: video?.buffered?.length
+        ? Number(video.buffered.end(video.buffered.length - 1).toFixed(3)) : 0,
+      mediaSource: typeof MediaSource,
+      srcObject: Boolean(video?.srcObject),
+      totalFrames: video?.getVideoPlaybackQuality?.().totalVideoFrames || 0,
+      peer: window.__lumaServerPeerConnection ? {
+        connectionState: window.__lumaServerPeerConnection.connectionState,
+        iceConnectionState: window.__lumaServerPeerConnection.iceConnectionState,
+      } : null,
+    };
+  });
   await page.mouse.up();
   const endedAt = performance.now();
   await page.waitForTimeout(500);
+  const rtcStats = await page.evaluate(async () => {
+    const peer = window.__lumaServerPeerConnection;
+    if (!peer) return null;
+    const rows = [];
+    for (const value of (await peer.getStats()).values()) {
+      if (['inbound-rtp', 'candidate-pair', 'remote-candidate', 'local-candidate', 'codec'].includes(value.type)) {
+        rows.push(Object.fromEntries(Object.entries(value)));
+      }
+    }
+    return rows;
+  });
 
   const activeReceived = receivedAt.filter(value => value >= startedAt && value <= endedAt);
   const activeFrames = activeReceived.length;
@@ -62,9 +102,13 @@ const { chromium } = require('playwright-core');
     frames_during_drag: activeFrames,
     camera_updates_sent: sentAt.filter(value => value >= startedAt && value <= endedAt).length,
     delivered_fps: Number((activeFrames * 1000 / (endedAt - startedAt)).toFixed(1)),
+    displayed_video_fps: Number((Math.max(0, videoDuringDrag.totalFrames - videoFramesAtStart) * 1000 /
+      (endedAt - startedAt)).toFixed(1)),
     median_interval_ms: intervals.length ? Math.round(intervals.sort((a, b) => a - b)[Math.floor(intervals.length / 2)]) : null,
     ui_fps: await page.locator('#fpsValue').textContent(),
     metrics: await page.locator('#serverMetrics').textContent(),
+    video: videoDuringDrag,
+    rtc: rtcStats,
     camera: await page.evaluate(() => ({ ...window.__lumaServerCamera })),
     errors
   };
@@ -72,7 +116,14 @@ const { chromium } = require('playwright-core');
   await browser.close();
 
   const minimum = Number(process.env.MIN_STREAM_FPS ?? 20);
-  if (errors.length || result.delivered_fps < minimum) {
+  const requireVideo = process.env.REQUIRE_VIDEO === '1';
+  const requireWebRTC = process.env.REQUIRE_WEBRTC === '1';
+  if (errors.length || result.delivered_fps < minimum ||
+      (requireVideo && (result.video.currentTime <= 0 ||
+        (!result.video.srcObject && result.video.bufferedEnd <= 0))) ||
+      (requireWebRTC && (!result.video.srcObject ||
+        !['connected', 'completed'].includes(result.video.peer?.iceConnectionState) ||
+        result.displayed_video_fps < minimum))) {
     console.error(`server stream regression: ${result.delivered_fps} FPS < ${minimum} FPS`);
     process.exit(1);
   }

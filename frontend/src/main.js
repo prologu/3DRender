@@ -14,7 +14,7 @@ const els = {
   fullscreen: $('#fullscreen'), backgroundSelect: $('#backgroundSelect'), qualitySelect: $('#qualitySelect'),
   dragOverlay: $('#dragOverlay'), toast: $('#toast'), webglBadge: $('#webglBadge'),
   clientMode: $('#clientMode'), streamMode: $('#streamMode'), serverMode: $('#serverMode'), serverViewport: $('#serverViewport'),
-  serverFrame: $('#serverFrame'), serverCanvas: $('#serverCanvas'), serverMetrics: $('#serverMetrics'), welcomeDescription: $('#welcomeDescription'),
+  serverFrame: $('#serverFrame'), serverCanvas: $('#serverCanvas'), serverVideo: $('#serverVideo'), serverMetrics: $('#serverMetrics'), welcomeDescription: $('#welcomeDescription'),
   dropTitle: $('#dropTitle'), dropSubtitle: $('#dropSubtitle'), backendLabel: $('#backendLabel'),
   renderModeLabel: $('#renderModeLabel'), privacyTitle: $('#privacyTitle'), privacyText: $('#privacyText'),
   lodSlider: $('#lodSlider'), lodValue: $('#lodValue'), navPad: $('#navPad'), streamSource: $('#streamSource'),
@@ -47,6 +47,8 @@ let serverRequestPending = false;
 let serverSession = null;
 let serverSupportsStream = false;
 let serverSupportsWebSocket = false;
+let serverSupportsVideo = false;
+let serverSupportsWebRTC = false;
 let serverUpdateRunning = false;
 let serverUpdatePending = null;
 let serverSocket = null;
@@ -55,8 +57,16 @@ let serverSocketRaf = null;
 let serverSocketSentSeq = 0;
 let serverSocketAckSeq = 0;
 let serverFrameDecoding = false;
-let serverFramePending = null;
+let serverFramePending = [];
 let serverCanvasContext = null;
+let serverMediaSource = null;
+let serverSourceBuffer = null;
+let serverVideoUrl = null;
+let serverVideoQueue = [];
+let serverVideoGeneration = null;
+let serverPeerConnection = null;
+let serverVideoTransport = null;
+let serverVideoInteractive = false;
 let serverSentAt = new Map();
 let serverSettleTimer = null;
 let serverMetricsTimer = null;
@@ -190,19 +200,29 @@ function lodFraction() {
 function serverRenderPayload(interactive = false) {
   const performanceMode = els.qualitySelect.value === 'performance';
   const requestedLod = lodFraction();
+  const fullCount = Math.max(1, serverStatus?.gaussians || 1);
+  // Sorting and rasterizing every point dominates motion latency on large
+  // scenes even after the video transport is fixed. During motion, bound the
+  // working set by an absolute point budget; the settled frame immediately
+  // restores the user's slider value. An absolute cap also scales to multi-
+  // million scenes, unlike a fixed percentage.
+  const motionBudget = performanceMode ? 300_000 : 550_000;
+  const effectiveLod = interactive
+    ? Math.min(requestedLod, motionBudget / fullCount)
+    : requestedLod;
   return {
     ...serverCamera,           // 含 yaw/pitch/distance/pan
     ...serverResolution(interactive),
     background: backgroundRgb(),
     fov: 55,
-    // 旋转前后严格使用相同点集，避免交互帧暗中降到 25%/35% 后出现结构消失。
-    // 需要降低负载时由用户显式选择性能模式或高斯加载量，而不是随鼠标状态切换模型。
-    lod: requestedLod,
+    // 交互阶段使用有上限的稳定点集；停止操作后恢复滑杆指定的最终质量。
+    lod: effectiveLod,
     lock_lod: true,
     // Motion frames favor latency/bandwidth; the settled frame restores quality.
     jpeg_quality: interactive
       ? [performanceMode ? 50 : 58, 45, 30][serverInteractiveTier]
       : (performanceMode ? 82 : 90),
+    video_transport: serverVideoTransport || (serverSupportsVideo ? 'h264-fmp4' : null),
     interactive
   };
 }
@@ -309,6 +329,13 @@ async function connectServer() {
     serverDevice = status.device || null;
     serverSupportsStream = Boolean(status.capabilities?.mjpeg_stream);
     serverSupportsWebSocket = Boolean(status.capabilities?.websocket_stream && window.WebSocket);
+    serverSupportsVideo = Boolean(
+      !window.LUMA_DISABLE_VIDEO && status.capabilities?.h264_fmp4 && window.MediaSource &&
+      MediaSource.isTypeSupported('video/mp4; codecs="avc1.42C00D"')
+    );
+    serverSupportsWebRTC = Boolean(
+      !window.LUMA_DISABLE_VIDEO && status.capabilities?.webrtc_stream && window.RTCPeerConnection
+    );
     updateModeUi();
     els.webglBadge.classList.add('ok');
     els.webglBadge.lastChild.textContent = ` ${deviceLabel()} 就绪 · ${status.gpu.free_mib} MiB`;
@@ -372,9 +399,13 @@ function updateStreamMetrics(stats) {
   const lod = stats.gaussians ? ` · ${formatCount(stats.gaussians)} GS` : '';
   const latency = Number.isFinite(stats.e2e_ms) ? ` · E2E ${Math.round(stats.e2e_ms)} ms` : '';
   const dropped = stats.dropped_frames ? ` · 丢旧帧 ${stats.dropped_frames}` : '';
-  const bytes = stats.jpeg_bytes ? ` · ${(stats.jpeg_bytes / 1024).toFixed(1)} KiB` : '';
+  const payloadBytes = stats.video_bytes || stats.jpeg_bytes;
+  const bytes = payloadBytes ? ` · ${(payloadBytes / 1024).toFixed(1)} KiB` : '';
   const phase = stats.interactive ? '交互' : '清晰';
-  els.serverMetrics.textContent = `${phase} ${stats.width}×${stats.height}${lod} · GPU ${stats.render_ms || '—'} ms${latency}${bytes}${dropped} · ${stats.peak_allocated_mib || '—'} MiB`;
+  const transport = stats.encoding === 'webrtc'
+    ? ' WebRTC'
+    : (stats.encoding === 'fmp4' ? ' H.264' : '');
+  els.serverMetrics.textContent = `${phase}${transport} ${stats.width}×${stats.height}${lod} · GPU ${stats.render_ms || '—'} ms${latency}${bytes}${dropped} · ${stats.peak_allocated_mib || '—'} MiB`;
 
   if (stats.interactive && Number.isFinite(stats.e2e_ms)) {
     // E2E 超预算时单向降档，避免链路抖动时分辨率反复跳档。这里只改变图像码率；
@@ -406,19 +437,149 @@ function recordDisplayedServerFrame(stats = null) {
   if (!serverDrag) setHybridVisible(false);
 }
 
+function closeServerVideo() {
+  serverVideoQueue = [];
+  serverVideoGeneration = null;
+  serverSourceBuffer = null;
+  serverMediaSource = null;
+  els.serverViewport.classList.remove('video-stream');
+  if (!serverPeerConnection) {
+    els.serverVideo.pause();
+    els.serverVideo.removeAttribute('src');
+    els.serverVideo.load();
+  }
+  if (serverVideoUrl) URL.revokeObjectURL(serverVideoUrl);
+  serverVideoUrl = null;
+}
+
+function closeServerWebRTC() {
+  const peer = serverPeerConnection;
+  serverPeerConnection = null;
+  window.__lumaServerPeerConnection = null;
+  serverVideoTransport = null;
+  serverVideoInteractive = false;
+  if (peer) peer.close();
+  els.serverVideo.srcObject = null;
+  closeServerVideo();
+}
+
+function waitForIceGathering(peer, timeoutMs = 5000) {
+  if (peer.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise(resolve => {
+    const timeout = setTimeout(done, timeoutMs);
+    function done() {
+      clearTimeout(timeout);
+      peer.removeEventListener('icegatheringstatechange', changed);
+      resolve();
+    }
+    function changed() { if (peer.iceGatheringState === 'complete') done(); }
+    peer.addEventListener('icegatheringstatechange', changed);
+  });
+}
+
+async function attachServerWebRTC(payload) {
+  closeServerWebRTC();
+  const peer = new RTCPeerConnection({ iceServers: [] });
+  serverPeerConnection = peer;
+  window.__lumaServerPeerConnection = peer;
+  const transceiver = peer.addTransceiver('video', { direction: 'recvonly' });
+  const codecs = RTCRtpReceiver.getCapabilities?.('video')?.codecs || [];
+  if (transceiver.setCodecPreferences && codecs.length) {
+    const h264 = codecs.filter(codec => codec.mimeType.toLowerCase() === 'video/h264');
+    const other = codecs.filter(codec => codec.mimeType.toLowerCase() !== 'video/h264');
+    transceiver.setCodecPreferences([...h264, ...other]);
+  }
+  peer.ontrack = event => {
+    els.serverVideo.srcObject = event.streams[0] || new MediaStream([event.track]);
+    void els.serverVideo.play().catch(() => {});
+    const displayed = () => {
+      if (serverPeerConnection !== peer) return;
+      if (serverVideoInteractive) {
+        els.serverViewport.classList.add('video-stream', 'ready');
+        recordDisplayedServerFrame();
+      }
+      els.serverVideo.requestVideoFrameCallback?.(displayed);
+    };
+    els.serverVideo.requestVideoFrameCallback?.(displayed);
+  };
+  const offer = await peer.createOffer();
+  await peer.setLocalDescription(offer);
+  await waitForIceGathering(peer);
+  const response = await fetch(new URL(payload.webrtc_url, API_BASE), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(peer.localDescription),
+    signal: AbortSignal.timeout(15000)
+  });
+  if (!response.ok) throw new Error(`WebRTC HTTP ${response.status}`);
+  await peer.setRemoteDescription(await response.json());
+  serverVideoTransport = 'webrtc';
+}
+
+function pumpServerVideo() {
+  if (!serverSourceBuffer || serverSourceBuffer.updating || !serverVideoQueue.length) return;
+  try {
+    serverSourceBuffer.appendBuffer(serverVideoQueue.shift());
+  } catch (error) {
+    console.warn('H.264 视频片段追加失败:', error);
+    closeServerVideo();
+  }
+}
+
+function appendServerVideo(stats, payload) {
+  const generation = stats.video_generation;
+  if (stats.encoding === 'fmp4-init') {
+    closeServerVideo();
+    serverVideoGeneration = generation;
+    serverVideoQueue.push(payload.slice());
+    const mediaSource = new MediaSource();
+    serverMediaSource = mediaSource;
+    serverVideoUrl = URL.createObjectURL(mediaSource);
+    els.serverVideo.src = serverVideoUrl;
+    els.serverVideo.onplaying = () => els.serverViewport.classList.add('video-stream');
+    mediaSource.addEventListener('sourceopen', () => {
+      if (serverMediaSource !== mediaSource || serverVideoGeneration !== generation) return;
+      try {
+        const mime = `video/mp4; codecs="${stats.video_codec}"`;
+        serverSourceBuffer = mediaSource.addSourceBuffer(mime);
+        serverSourceBuffer.mode = 'segments';
+        serverSourceBuffer.addEventListener('updateend', () => {
+          if (els.serverVideo.buffered.length) {
+            const end = els.serverVideo.buffered.end(els.serverVideo.buffered.length - 1);
+            if (!Number.isFinite(els.serverVideo.currentTime) || end - els.serverVideo.currentTime > 0.18) {
+              els.serverVideo.currentTime = Math.max(0, end - 0.04);
+            }
+            void els.serverVideo.play().catch(() => {});
+          }
+          pumpServerVideo();
+        });
+        pumpServerVideo();
+      } catch (error) {
+        console.warn('浏览器无法启动 H.264 MediaSource:', error);
+        closeServerVideo();
+      }
+    }, { once: true });
+    return;
+  }
+  if (generation !== serverVideoGeneration || !serverMediaSource) return;
+  serverVideoQueue.push(payload.slice());
+  pumpServerVideo();
+  updateStreamMetrics(stats);
+  recordDisplayedServerFrame(stats);
+}
+
 async function displayWebSocketFrame(packet) {
-  serverFramePending = packet;
+  if (packet) serverFramePending.push(packet);
   if (serverFrameDecoding) return;
   serverFrameDecoding = true;
   try {
-    while (serverFramePending && serverSession && serverSocket) {
-      const latest = serverFramePending;
-      serverFramePending = null;
+    while (serverFramePending.length && serverSession && serverSocket) {
+      const latest = serverFramePending.shift();
       const buffer = latest instanceof ArrayBuffer ? latest : await latest.arrayBuffer();
       if (buffer.byteLength < 6) continue;
       const view = new DataView(buffer);
       const statsLength = view.getUint32(0, false);
-      if (statsLength <= 0 || statsLength + 4 >= buffer.byteLength) continue;
+      if (statsLength <= 0 || statsLength + 4 > buffer.byteLength) continue;
       const stats = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 4, statsLength)));
       if (Number.isFinite(stats.client_seq)) {
         serverSocketAckSeq = Math.max(serverSocketAckSeq, stats.client_seq);
@@ -428,18 +589,25 @@ async function displayWebSocketFrame(packet) {
           if (seq <= stats.client_seq) serverSentAt.delete(seq);
         }
       }
-      const jpeg = new Blob([buffer.slice(4 + statsLength)], { type: 'image/jpeg' });
-      const bitmap = await createImageBitmap(jpeg);
-      // 解码期间如果已有更新，只画最新帧，避免旧视角排队造成拖尾。
-      if (serverFramePending) {
-        bitmap.close();
+      const payload = new Uint8Array(buffer, 4 + statsLength);
+      if (stats.encoding === 'webrtc') {
+        serverVideoInteractive = true;
+        updateStreamMetrics(stats);
         continue;
       }
+      if (stats.encoding === 'fmp4-init' || stats.encoding === 'fmp4') {
+        appendServerVideo(stats, payload);
+        continue;
+      }
+      const jpeg = new Blob([buffer.slice(4 + statsLength)], { type: 'image/jpeg' });
+      const bitmap = await createImageBitmap(jpeg);
       if (els.serverCanvas.width !== bitmap.width) els.serverCanvas.width = bitmap.width;
       if (els.serverCanvas.height !== bitmap.height) els.serverCanvas.height = bitmap.height;
       serverCanvasContext ||= els.serverCanvas.getContext('2d', { alpha: false, desynchronized: true });
       serverCanvasContext.drawImage(bitmap, 0, 0);
       bitmap.close();
+      serverVideoInteractive = false;
+      closeServerVideo();
       updateStreamMetrics(stats);
       recordDisplayedServerFrame(stats);
     }
@@ -447,7 +615,7 @@ async function displayWebSocketFrame(packet) {
     console.warn('WebSocket 帧解码失败:', error);
   } finally {
     serverFrameDecoding = false;
-    if (serverFramePending && serverSession && serverSocket) void displayWebSocketFrame(serverFramePending);
+    if (serverFramePending.length && serverSession && serverSocket) void displayWebSocketFrame();
   }
 }
 
@@ -466,7 +634,8 @@ async function closeServerSession() {
   serverSentAt.clear();
   serverUpdatePending = null;
   serverSocketPending = null;
-  serverFramePending = null;
+  serverFramePending = [];
+  closeServerWebRTC();
   const closingSession = serverSession;
   serverSession = null;
   const closingSocket = serverSocket;
@@ -482,8 +651,8 @@ async function closeServerSession() {
   els.serverCanvas.height = 0;
   serverCanvasContext = null;
   if (closingSession) {
-    fetch(`${API_BASE}/api/session/${closingSession}`, {
-      method: 'DELETE', keepalive: true
+    fetch(`${API_BASE}/api/session/${closingSession}/close`, {
+      method: 'POST', keepalive: true
     }).catch(() => {});
   }
 }
@@ -646,6 +815,15 @@ async function openServerSession() {
     if (!response.ok) return false;
     const payload = await response.json();
     serverSession = payload.session;
+    if (serverSupportsWebRTC && payload.webrtc_url) {
+      try {
+        await attachServerWebRTC(payload);
+      } catch (error) {
+        console.warn('WebRTC 视频不可用，回退 H.264/WebSocket:', error);
+        serverSupportsWebRTC = false;
+        closeServerWebRTC();
+      }
+    }
     if (serverSupportsWebSocket && payload.websocket_url) {
       try {
         await attachServerWebSocket(payload);
@@ -1465,7 +1643,10 @@ if (els.lodSlider) {
 
 window.addEventListener('pagehide', () => {
   if (serverSession) {
-    fetch(`${API_BASE}/api/session/${serverSession}`, { method: 'DELETE', keepalive: true }).catch(() => {});
+    // A cross-origin DELETE needs a preflight which is not guaranteed to
+    // finish during pagehide. sendBeacon is a simple POST and reliably frees
+    // the session even when the tab is closed immediately.
+    navigator.sendBeacon(`${API_BASE}/api/session/${serverSession}/close`, '');
   }
 });
 

@@ -8,7 +8,7 @@
 | 大场景分页渲染 | 用户浏览器 / Spark 2.4 / WebGL 2 | 预构建 `.rad` + `.radc` | 城市级/任意总规模场景；按视角下载，固定显存工作集 |
 | GPU 服务端渲染 | Linux + PyTorch GPU + gsplat | 标准 binary little-endian 3DGS `.ply` | NVIDIA/CUDA 为稳定路径；AMD/ROCm 为实验路径 |
 
-服务端模式优先使用**单条双向 WebSocket**：同一连接上传相机状态、下传统计信息和 JPEG 帧；浏览器不支持或代理阻断 WebSocket 时自动回退 MJPEG。相机控制不等待图像 ACK，每个浏览器动画帧最多发一个最新视角；服务端接收、GPU 渲染和 socket 写出分别运行，只保留一个尚未发送的最新图像，慢链路会覆盖旧图而不会阻塞后续拖动。拖动期间已完成的图像即使被更新的相机 revision 超越也会提交，避免连续 60 Hz 指针事件让画面饿死。拖动时只降低图像分辨率和 JPEG 码率，不减少滑杆选定的 Gaussian 点集；Tailscale `100.64.0.0/10` 地址直接从 256×144 低延迟档开始，其他地址根据 E2E 从 640×360 向 400×225、256×144 单向降级，停止操作后自动补当前质量档的清晰帧。页面同时显示实际流帧率、GPU 渲染耗时、E2E、帧大小和旧帧数。
+服务端模式优先使用 **WebRTC/H.264 视频轨**下传交互画面，双向 WebSocket 只发送最新相机状态和轻量统计，从根源避开 TCP 队头阻塞；若 WebRTC 不可用则依次回退 H.264/fMP4 over WebSocket、JPEG over WebSocket 和 MJPEG。服务端接收、GPU 渲染与传输解耦，待发槽始终只保留最新帧。拖动时按绝对预算使用稳定的 55 万点（性能模式 30 万点）并自适应分辨率，停止后立即恢复滑杆指定的最终点数和清晰分辨率。页面显示实际解码显示帧率、GPU 耗时、E2E 和丢旧帧数。
 
 大场景模式使用 Spark 的预构建 LoD 树和共享 LRU page pool。场景总量可以远大于浏览器显存，实际显存只保留当前视角需要的 4M/8M Gaussian 工作集（移动端默认更低），并通过 `.RADC` 分块并行预取。该模式与 CityGS 的 Spark 路线兼容，但代码完全位于本仓库，没有修改 `citygs-spark-docker`。
 
@@ -147,7 +147,7 @@ npm run build-lod -- /data/city.ply --quality --rad-chunked
 - Linux x86_64，已验证 Ubuntu 22.04。
 - CPython 3.10；预编译 wheel 名称包含 `cp310`，其他 Python 版本不能直接使用。
 - NVIDIA 驱动可运行 CUDA 11.8 构建的 PyTorch，先确认 `nvidia-smi` 正常。
-- 已验证组合：PyTorch `2.0.1+cu118`、gsplat `1.5.3+pt20cu118`、NumPy `1.26.4`、Pillow `10.4.0`、setuptools `80.10.2`（必须 <81，setuptools 81 移除了渲染路径用到的 `pkg_resources`）；`opencv-python-headless` 可选，个别构建上作为更快的 JPEG 后端（`LUMA_JPEG_BACKEND=opencv`）。
+- 已验证组合：PyTorch `2.0.1+cu118`、gsplat `1.5.3+pt20cu118`、NumPy `1.26.4`、Pillow `10.4.0`、PyAV `14.2.0`、aiortc `1.15.0`、setuptools `80.10.2`（必须 <81）。视频依赖锁定在 `requirements-video.txt`；WebRTC 不可用时仍可自动回退 JPEG/MJPEG。
 - 依赖安装到 `server/python/`，不修改系统 Python，也不创建或停止系统服务。
 
 ### AMD RX 7700 XT / ROCm 实验路径
@@ -172,7 +172,7 @@ python -m pip install --index-url https://repo.amd.com/rocm/whl-multi-arch/ rocm
 PYTORCH_ROCM_ARCH=gfx1101 MAX_JOBS=2 bash ./server/setup-rocm-gsplat.sh
 ```
 
-`setup-rocm-gsplat.sh` 固定使用已验证的 gsplat HIP PR revision，并应用 ROCm 7.14 的 cooperative-groups 兼容补丁。AMD 仓库下载较慢时，脚本也支持把 rocThrust、rocPRIM、hipCUB 等头文件放在 `~/luma/rocm-headers` 的轻量回退方式。启动时无需重新激活环境：
+`setup-rocm-gsplat.sh` 固定使用已验证的 gsplat HIP PR revision，应用 ROCm 7.14 兼容补丁，并安装 PyAV/aiortc 视频依赖。AMD 仓库下载较慢时，脚本也支持把 rocThrust、rocPRIM、hipCUB 等头文件放在 `~/luma/rocm-headers` 的轻量回退方式。启动时无需重新激活环境：
 
 ```bash
 LUMA_PYTHON="$HOME/miniconda3/envs/ljq-rocm/bin/python" \
@@ -281,28 +281,28 @@ curl http://127.0.0.1:8090/health
 curl http://127.0.0.1:8090/api/status
 ```
 
-主要接口：`POST /api/model`、`POST /api/render`、`POST /api/session`、`GET /api/session/{id}/ws`（首选双向帧流）、`POST /api/session/{id}/camera` + `GET /api/session/{id}/stream`（MJPEG 兼容路径）、`GET /api/model.splat?frac=0.25`。请求细节见 [技术架构](docs/ARCHITECTURE.md)。
+主要接口：`POST /api/model`、`POST /api/render`、`POST /api/session`、`POST /api/session/{id}/webrtc`（SDP 协商）、`GET /api/session/{id}/ws`（相机控制/统计与视频降级）、`POST /api/session/{id}/camera` + `GET /api/session/{id}/stream`（MJPEG 兼容路径）、`GET /api/model.splat?frac=0.25`。请求细节见 [技术架构](docs/ARCHITECTURE.md)。
 
 ### 性能优化（服务端帧流水线）
 
-当前版本已实现，A5000 部署实测（1.16M Gaussian 场景，960×540，full LOD）：
+当前版本已在 RX 7700 XT/ROCm 实机部署，并保留此前 A5000/CUDA 回归数据：
 
 | 优化 | 行为 | 实测数据 |
 | --- | --- | --- |
-| WebSocket latest-frame 流水 | 相机 JSON 与 JPEG 帧复用一条持久连接；二进制帧为 `4-byte stats 长度 + stats JSON + JPEG`。控制消息按 RAF 合并、完全不等待下行图像确认；服务端接收/渲染/写 socket 解耦，出站只有一个可覆盖槽，TCP 发送缓冲受限；浏览器解码拥塞时也只画最新帧 | 消除 ACK 窗口和阻塞 `sendall` 造成的旧视角长队列；1M/RX 7700 XT 的连续拖动实测从约 6 FPS、746–2759 ms E2E 改善到 25.4 FPS，松手后的 1280×720 清晰帧 E2E 166 ms；`client_seq`、`jpeg_bytes` 与 `dropped_frames` 可观察背压 |
+| WebRTC latest-frame 视频流水 | WebSocket 只承载相机 JSON 与统计，交互像素经 aiortc/libx264 走 WebRTC H.264/RTP；渲染轨与发送端都采用单槽 latest-frame。SDP 过滤劣化的 Tailscale ULA IPv6 候选，让 ICE 在 LAN/100.x IPv4 中择优 | 1M/RX 7700 XT 实测：错误 IPv6 路径 RTT 437 ms、丢包 22%、5.1 FPS；改选 100.64 IPv4 后 RTT 53–114 ms、零丢包，全量 18.8 FPS，55 万交互预算实际显示 25.4 FPS |
 | 交互码率自适应 | 高清/性能的静止帧仍为 1280×720 / 800×450；Tailscale 地址直接用 256×144，其他地址从 640×360 开始，E2E 超过 450 ms 时依次降到 400×225、256×144，JPEG 质量为 30–58；页面生命周期内只降不升，停止拖动后补发 82/90 清晰帧 | 避免 Tailscale 上用两个 RTT 探测已知不可持续的高码率，也避免 256p/640p 来回振荡；不会让一张 720p JPEG 阻塞后续相机状态 |
-| 旋转点集锁定 | 网页端所有会话使用 `lock_lod=true`；旋转帧与静止帧使用完全相同的滑杆点数，只在交互期间改变输出图像尺寸和 JPEG 质量。协议统计返回 `interactive`、`lod_locked` 便于自动测试 | 2,146,592 点回归中每一帧仍使用 2,146,592 点；50% 滑杆下每一帧均为 1,073,296 点，不再出现 100%↔25%/35% 结构跳变 |
+| 交互点预算 | 每个交互阶段使用稳定的 `min(滑杆上限, 550K)` 点集（性能模式 300K），不在拖动中反复跳档；停止后恢复滑杆指定的最终点数 | 1M 场景从全量 18.8 FPS 提升到 25.4 FPS；静止清晰帧仍为 1M/1280×720 |
 | 服务端自适应 LOD | 未设置 `lock_lod=true` 的 API 客户端，帧耗时超过 `FRAME_BUDGET_MS` 时按比例自动降 LOD，客户端档位为上限，有余量逐步回升 | 网页默认锁定点集以保证视觉连续；批处理或自定义客户端可不锁定并选择“帧率优先”的自动 LOD |
 | 空闲帧提交 | 相机静止 100 ms 后仅补发一次已编码 JPEG，促使 Chromium 提交首帧/最终帧；不重新调用 GPU 渲染，也不持续传输 | 浏览器静止首帧可见；之后保持空闲，无连续重传 |
 | 多会话 CUDA stream 并发 | 移除渲染路径全局锁，每个渲染调用从流池取独立 `torch.cuda.Stream`（池大小 = 会话上限），仅模型加载保留互斥 | 相机 50ms 更新下：单会话 19.6 fps，双会话各 19.3 fps，四会话各 18.9 fps（与单会话持平，无头程阻塞） |
 | LOD 选点策略（重要性前缀为默认） | 默认按 `不透明度 × 最大尺度²` 的重要性前缀截取（每个 LOD 都是同一组张量的稳定前缀，质量切换不重排、不建索引缓冲）。实测该模型所有高斯尺度几乎均匀（max_scale≈0.009），重要性≈不透明度，top-N 前缀天然把表面铺满、无可见空洞；空间叶选择（`--spatial-lod`，近处贪心）对这类表面模型会饿死远处覆盖（2.35% 洞），故降为实验项默认关闭 | 25% 预算（960×540）：前缀 290K 点，渲染 8.8 ms（≤33 ms 预算）；恢复后 25% 帧与旧版前缀帧逐像素一致（diff 0.00%），可见像素覆盖率 10.27% |
 | 任意方向连续 360° 旋转 | `yaw`、`pitch` 仅做周期归一化，不做俯仰钳位；前后端统一使用解析 `forward/right/up` 基，`right` 不再由 `cross(worldUp, forward)` 求得，因此经过 ±90° 两个极点时不退化、不跳变 | A5000 浏览器实测 2,146,592 点：拖动后 `pitch=1.759 rad`（约 100.8°，已越过旧 ±87° 限制），三个基向量长度均为 1、两两点积约 0；服务端单元测试覆盖两个极点、完整 2π 周期和超大角度 |
-| 显式质量控制 | “高清/性能”选择停止操作后的 1280×720 或 800×450 清晰帧；高斯加载量滑杆选择 10%–100% 固定点集。交互图像分辨率自动降低，但点集不变 | 用户仍明确控制模型结构完整度；短暂的交互低分辨率换取响应速度，停止后恢复清晰度 |
+| 显式质量控制 | “高清/性能”选择停止操作后的 1280×720 或 800×450 清晰帧；高斯加载量滑杆选择最终 10%–100% 点数。交互阶段受 550K/300K 上限保护 | 用户控制最终结构完整度；移动时以临时点预算换取响应速度，停止后恢复最终点数和清晰度 |
 | 客户端混合渲染（默认关闭） | 服务端导出 25% 粗模（`GET /api/model.splat`，32 字节/点），前端叠加画布本地渲染以提供拖动即时反馈。因服务端已可在帧预算内渲染全量点，叠加层只渲染 25% 稀疏点反而产生空洞，故默认关闭（`USE_HYBRID_PREVIEW`，置 true 重新启用） | 默认下拖动直接显示全质量服务端帧（1,160,393 点、15-19 ms）；需要本地即时反馈时开启叠加层（9.3 MB 粗模下载一次） |
 | 交互手感 + 前后左右移动 + 高斯加载量滑杆 | ① 旋转前后保持同一固定点集；② 旋转灵敏度按视口尺寸计算（拖满视口高约转 120°）；③ 导航盘和键盘沿相机屏幕轴累计 `pan`，步长随距离缩放；④ 10%–100% 滑杆直接设置固定点数比例 | 旋转、移动、缩放三种操作互不混淆；跨极点移动方向保持一致；降低点数只会在用户调整滑杆时发生 |
 | 旋转与移动区分 + 指针捕获兜底 | ① **左键拖动 = 旋转、右键拖动 = 移动（屏幕平面平移）、滚轮 = 缩放**——鼠标键位明确区分旋转与移动（右键菜单已屏蔽）；② 导航盘（↑↓←→ + 中心停止）与 `WASD`/方向键使用**屏幕轴**，并与服务端共享同一组连续解析相机基；③ 使用 Pointer Capture、合并高频 pointer sample，并由 window 级 `pointerup/pointercancel` 和 `lostpointercapture` 共同收尾 | 鼠标移出视口、全屏/UI 抢占或操作系统中断捕获后都不会出现“拖不动”或“松手后仍卡住”；浏览器测试核对左键只改 yaw/pitch、右键只改 pan |
 
-浏览器侧 out-of-core 分块流式加载已由 Spark `.RAD/.RADC` 路线落地；服务端 Python/gsplat 路径仍是完整模型常驻 GPU。后续服务端 tile cache 与 WebRTC/H.264 多用户视频传输见 [大规模场景路线](docs/LARGE_SCENES.md)。当前 WebSocket 传 JPEG 已解决控制排队，但不是视频编码器，公网高并发仍建议 WebRTC。
+浏览器侧 out-of-core 分块流式加载已由 Spark `.RAD/.RADC` 路线落地；服务端 Python/gsplat 路径仍是完整模型常驻 GPU。WebRTC/H.264 已用于低延迟画面传输；服务端 tile cache 与多 GPU 调度仍见 [大规模场景路线](docs/LARGE_SCENES.md)。
 
 可用连续拖动基准核对真实到达帧率（测试会输出 `delivered_fps`、发送相机数、E2E 和当前码率）：
 
@@ -310,10 +310,11 @@ curl http://127.0.0.1:8090/api/status
 cd frontend
 VIEWER_URL=http://100.64.0.60:8088/ \
 RENDER_API=http://100.64.0.60:8090 \
+REQUIRE_VIDEO=1 REQUIRE_WEBRTC=1 MIN_STREAM_FPS=20 \
 npm run test:server-performance
 ```
 
-当前 RX 7700 XT + Tailscale 链路用 1,200 Gaussian 回归夹具实测：修复前 5.43 秒连续拖动仅收到 1 帧（0.2 FPS、E2E 约 3.9 秒）；小夹具可稳定超过 20 FPS。2026-10-31 用 **1,000,000 Gaussian 全量点集**连续拖动，客户端发送 312 个最新相机状态、收到 274 帧，测得 25.4 FPS（页面实时值 24 FPS）；松手后的 1280×720 清晰帧 GPU 12 ms、E2E 166 ms。服务端主动覆盖 251 个过期结果而不是让它们排队。测试脚本默认 **20 FPS** 下限适用于传输回归；百万点跨 Tailscale 的实际结果仍会随链路吞吐变化。
+2026-10-31 在 RX 7700 XT + Tailscale 上用 **1,000,000 Gaussian** 连续拖动：WebRTC 选中 100.64 IPv4、H.264 256×144、零 RTP 丢包；全量点实际显示 18.8 FPS，默认 550K 移动预算为 25.4 FPS，控制/渲染统计 25.7 FPS。测试同时读取 `getVideoPlaybackQuality()` 和 WebRTC stats，不再把收到统计包误当作已显示视频帧。
 
 2026-10-31 规模基准（确定性城市体，持续环绕相机；浏览器视口 1280×720）：
 
@@ -324,7 +325,7 @@ npm run test:server-performance
 | 1M | 73.5–74.2 FPS（3 次） | 78.1 FPS / 12.8 ms | 182.5 MiB |
 | 2M | 71.6 FPS（加载 7.9 s） | — | — |
 
-这组数据说明百万点不应默认走远程逐帧 JPEG：本地 GPU 已能稳定交互，而且没有 RTT/带宽成本。当前 gsplat HIP/RDNA3 组合还有一个反直觉特征：1M 全量点在 256×144 为 27.9 FPS，在 512×288、640×360、800×450 分别为 57.6、73.4、约 78 FPS；进一步降到 192×108 反而只有约 18–21 FPS，因此最低档保持 256×144。当前慢速 Tailscale 上，旧同步发送路径的 512×288（约 3.4 KiB/帧）在线仅 6.5 FPS、E2E 约 2.76 秒；latest-frame 路径在同一 1M 模型最终测得 25.4 FPS，且不再积压旧视角。要稳定更高帧率仍应使用浏览器本地/分页模型流或更换局域网链路，逐帧 JPEG 的极限受实际带宽和丢包影响。
+这组数据说明百万点不应默认走远程逐帧 JPEG。当前 gsplat HIP/RDNA3 在过小画布上存在固定开销，因此最低交互档保持 256×144；WebRTC 使用帧间压缩、RTP 拥塞控制和 latest-frame 丢旧帧，不再让 JPEG/TCP 队头阻塞拖动。需要 60 FPS 或千万级模型时，仍优先选择浏览器本地或 `.RAD/.RADC` 分页渲染；服务端视频模式的上限同时受 GPU、编码器与链路 RTT 约束。
 
 若页面只有 1 FPS，先看 `GPU xx ms` 和 `E2E xx ms`：GPU 约 10–30 ms、E2E 却数百到数千毫秒，说明驱动和 ROCm 正常，瓶颈位于传输。可分别检查延迟和 32 KiB 实际吞吐：
 
@@ -334,7 +335,7 @@ curl -o /dev/null -sS -w 'connect=%{time_connect}s total=%{time_total}s size=%{s
   http://100.64.0.60:8088/assets/<当前构建的-js-文件>
 ```
 
-Tailscale 显示 `direct` 只表示未走 DERP，不保证 Wi-Fi/校园网吞吐。32 KiB 仍需数秒时，JPEG 流不可能达到实时视频帧率；优先改用稳定有线网络、同局域网地址或 SSH 单端口转发，并确认两端 MTU/丢包。页面的 FPS 在连续帧到达时显示实际流帧率；相机空闲后的单张清晰帧不会把整段空闲时间误报成 1 FPS。
+Tailscale 显示 `direct` 只表示未走 DERP，不保证 Wi-Fi/校园网吞吐。若 WebRTC stats 显示高 RTT/丢包，先确认选中的 remote candidate；本项目会过滤已验证会劣化的 ULA IPv6 服务端候选，优先让 ICE 选择 100.x/LAN IPv4。页面 FPS 来自浏览器实际提交的视频帧；相机空闲后的单张清晰帧不会把整段空闲时间误报成 1 FPS。
 
 ## 4. 前后端联调与访问
 

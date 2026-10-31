@@ -14,6 +14,7 @@
       <div id="serverViewport" aria-label="服务端 3D Gaussian Splatting 渲染视口">
         <img id="serverFrame" alt="服务端 3DGS 渲染画面" draggable="false" />
         <canvas id="serverCanvas" aria-label="服务端低延迟渲染画面"></canvas>
+        <video id="serverVideo" aria-label="服务端 H.264 低延迟视频" muted autoplay playsinline></video>
         <span id="serverMetrics" class="server-metrics">等待服务端</span>
       </div>
       <div class="ambient" aria-hidden="true"></div>
@@ -101,7 +102,7 @@
           </select>
         </label>
         <label class="setting-row" for="lodSlider">
-          <span><b>高斯加载量</b><small>拖动选择加载点数比例（置信度）</small></span>
+          <span><b>高斯加载量</b><small>最终画质上限；移动时自动限流，停止后恢复</small></span>
           <div class="lod-slider-row">
             <input id="lodSlider" type="range" min="10" max="100" step="5" value="100" />
             <strong id="lodValue" class="lod-value">100%</strong>
