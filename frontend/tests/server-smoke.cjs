@@ -64,6 +64,39 @@ const path = require('node:path');
     throw new Error(`continuous 360 camera basis failed: ${JSON.stringify(poleState)}`);
   }
 
+  // Six-direction navigation must move along the camera-local forward/right/up
+  // axes. This catches the old behavior where W/S merely panned screen-up/down.
+  const sampleMovement = async key => {
+    await page.locator('#resetView').click();
+    await page.keyboard.down(key);
+    await page.waitForTimeout(140);
+    await page.keyboard.up(key);
+    await page.waitForTimeout(40);
+    return page.evaluate(() => [...window.__lumaServerCamera.pan]);
+  };
+  const forwardPan = await sampleMovement('w');
+  const rightPan = await sampleMovement('d');
+  const risePan = await sampleMovement('e');
+  await page.locator('#resetView').click();
+  const zoomBefore = await page.evaluate(() => window.__lumaServerCamera.distance);
+  await page.locator('#zoomIn').click();
+  const zoomIn = await page.evaluate(() => window.__lumaServerCamera.distance);
+  await page.locator('#zoomOut').click();
+  const zoomOut = await page.evaluate(() => window.__lumaServerCamera.distance);
+  const movement = await page.evaluate(({ forwardPan, rightPan, risePan }) => {
+    const basis = window.__lumaCameraBasis(0, 0);
+    const dot = (a, b) => a.reduce((sum, value, index) => sum + value * b[index], 0);
+    return {
+      forward: dot(forwardPan, basis.forward),
+      right: dot(rightPan, basis.right),
+      rise: dot(risePan, basis.up)
+    };
+  }, { forwardPan, rightPan, risePan });
+  if (movement.forward <= 0 || movement.right <= 0 || movement.rise <= 0 ||
+      !(zoomIn < zoomBefore) || !(zoomOut > zoomIn)) {
+    throw new Error(`six-axis/zoom controls failed: ${JSON.stringify({ movement, zoomBefore, zoomIn, zoomOut })}`);
+  }
+
   await page.selectOption('#qualitySelect', 'performance');
   await page.waitForFunction(() => {
     const frame = document.querySelector('#serverFrame');
@@ -88,6 +121,9 @@ const path = require('node:path');
       height: canvas.height || frame.naturalHeight
     };
   });
+  result.apiBase = await page.evaluate(() => window.__lumaRenderApi);
+  result.movement = movement;
+  result.zoom = { before: zoomBefore, inward: zoomIn, outward: zoomOut };
   result.websocketConnections = websocketConnections;
   result.websocketFrames = websocketFrames;
   result.errors = errors;
@@ -95,6 +131,7 @@ const path = require('node:path');
   await browser.close();
   if ((expectedModel && result.file !== expectedModel) || result.splats === '—' ||
       result.width !== 800 || result.height !== 450 || result.transport !== 'websocket' ||
+      (!renderApi && !result.apiBase.endsWith(':8090')) ||
       websocketConnections < 1 || websocketFrames < 1 || errors.length) process.exit(1);
 })().catch(error => {
   console.error(error);

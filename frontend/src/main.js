@@ -99,7 +99,20 @@ function deviceLabel() {
   const name = (serverDevice || '').replace(/^NVIDIA\s+/i, '').trim();
   return name || 'GPU';
 }
-const API_BASE = window.LUMA_RENDER_API || window.location.origin;
+function defaultRenderApi() {
+  if (window.LUMA_RENDER_API) return window.LUMA_RENDER_API.replace(/\/$/, '');
+  // The bundled scene/upload server listens on 8088 while the GPU renderer
+  // listens on 8090. Other deployments keep same-origin behavior so a reverse
+  // proxy can expose both through one HTTPS origin.
+  if (window.location.port === '8088') {
+    const url = new URL(window.location.href);
+    url.port = '8090';
+    return url.origin;
+  }
+  return window.location.origin;
+}
+const API_BASE = defaultRenderApi();
+window.__lumaRenderApi = API_BASE;
 const WEBSOCKET_OPEN = 1;
 
 function hasWebGL2() {
@@ -194,7 +207,7 @@ function updateModeUi() {
   els.privacyTitle.textContent = server ? '服务端模式' : paged ? '按需流式' : '本地模式';
   els.privacyText.textContent = server ? '模型会上传到当前隔离容器' : paged ? '仅下载当前视角需要的分块' : '文件不会离开你的浏览器';
   els.controlHint.innerHTML = server
-    ? `<b>左键拖动</b> 旋转 <i></i><b>右键拖动</b> 移动 <i></i><b>滚轮</b> 缩放 <i></i><b>WASD/方向键/导航盘</b> 移动`
+    ? `<b>左键拖动</b> 360° 旋转 <i></i><b>右键拖动</b> 平移 <i></i><b>滚轮 / +/-</b> 缩放 <i></i><b>WASD</b> 前后左右 <i></i><b>Q/E</b> 下/上`
     : '<b>左键</b> 旋转 <i></i><b>右键</b> 平移 <i></i><b>滚轮</b> 缩放';
 }
 
@@ -1135,8 +1148,9 @@ els.qualitySelect.addEventListener('change', () => {
 });
 
 window.addEventListener('keydown', (event) => {
-  if (event.key.toLowerCase() === 'r' && viewer) resetView();
-  if (event.key.toLowerCase() === 'f' && viewer) els.fullscreen.click();
+  if (/^(input|select|textarea)$/i.test(event.target.tagName || '')) return;
+  if (event.key.toLowerCase() === 'r') resetView();
+  if (event.key.toLowerCase() === 'f') els.fullscreen.click();
 });
 window.addEventListener('dragenter', (event) => { event.preventDefault(); dragDepth++; els.dragOverlay.classList.add('visible'); });
 window.addEventListener('dragover', (event) => { event.preventDefault(); });
@@ -1199,19 +1213,31 @@ els.serverViewport.addEventListener('contextmenu', (event) => { if (renderLocati
 els.serverViewport.addEventListener('wheel', (event) => {
   if (renderLocation !== 'server' || !serverStatus) return;
   event.preventDefault();
-  const min = serverStatus.radius * 0.08;
-  const max = serverStatus.radius * 20;
-  serverCamera.distance = Math.max(min, Math.min(max, serverCamera.distance * Math.exp(event.deltaY * 0.001)));
-  if (hybridViewer) { setHybridVisible(true); syncHybridCamera(); }
-  scheduleServerRender(true);
+  zoomServerBy(Math.exp(event.deltaY * 0.001), true);
 }, { passive: false });
 
-// ===== 前后左右移动（pan）：按住按钮/方向键沿“屏幕轴”平移。屏幕轴与服务端 view_matrix 完全一致，相机越过天顶/天底时也不会反向 =====
-let panDir = null;            // { u: 上下系数, r: 左右系数 }（屏幕轴）
+function zoomServerBy(factor, interactive = false) {
+  if (renderLocation !== 'server' || !serverStatus) return;
+  const min = serverStatus.radius * 0.04;
+  const max = serverStatus.radius * 40;
+  serverCamera.distance = Math.max(min, Math.min(max, serverCamera.distance * factor));
+  if (hybridViewer) { setHybridVisible(true); syncHybridCamera(); }
+  scheduleServerRender(interactive);
+}
+window.__lumaZoomServer = zoomServerBy;
+
+// ===== 六方向自由移动 =====
+// pan 同时平移相机和观察目标，因此 forward/right/up 形成真正的相机局部
+// 三轴移动；distance 仅用于 zoom，不再把 W/S 错当成屏幕上下平移。
+let panDir = null;            // { f: 前后, u: 上下, r: 左右 }
 let activePanDirs = new Set();
 let panRaf = null;
-// 屏幕平面方向：up/down=屏幕上/下，left/right=屏幕左/右（始终与画面一致，不反向）
-const navDirVectors = { up: { u: 1, r: 0 }, down: { u: -1, r: 0 }, left: { u: 0, r: -1 }, right: { u: 0, r: 1 } };
+let panLastAt = null;
+const navDirVectors = {
+  forward: { f: 1, u: 0, r: 0 }, backward: { f: -1, u: 0, r: 0 },
+  left: { f: 0, u: 0, r: -1 }, right: { f: 0, u: 0, r: 1 },
+  rise: { f: 0, u: 1, r: 0 }, fall: { f: 0, u: -1, r: 0 }
+};
 // 相机屏幕轴（世界系），与服务端的连续解析相机基一致。
 function cameraMoveVectors() {
   const { yaw, pitch } = serverCamera;
@@ -1219,20 +1245,35 @@ function cameraMoveVectors() {
 }
 function recomputePanDir() {
   if (!activePanDirs.size) { panDir = null; return; }
-  let u = 0, r = 0;
-  for (const d of activePanDirs) { u += navDirVectors[d].u; r += navDirVectors[d].r; }
-  panDir = { u, r };
+  let f = 0, u = 0, r = 0;
+  for (const d of activePanDirs) {
+    f += navDirVectors[d].f; u += navDirVectors[d].u; r += navDirVectors[d].r;
+  }
+  const length = Math.hypot(f, u, r) || 1;
+  panDir = { f: f / length, u: u / length, r: r / length };
 }
 function updatePanLoop() {
   if (panDir && !panRaf) panRaf = requestAnimationFrame(panTick);
-  if (!panDir && panRaf) { cancelAnimationFrame(panRaf); panRaf = null; scheduleServerRender(false); }
+  if (!panDir) {
+    if (panRaf) cancelAnimationFrame(panRaf);
+    panRaf = null;
+    panLastAt = null;
+    scheduleServerRender(false);
+  }
 }
-function panTick() {
+function panTick(now) {
   panRaf = null;
   if (!panDir || renderLocation !== 'server' || !serverStatus) return;
-  const { up, right } = cameraMoveVectors();
-  const step = serverCamera.distance * 0.02;
-  for (let i = 0; i < 3; i++) serverCamera.pan[i] += (panDir.u * up[i] + panDir.r * right[i]) * step;
+  const { forward, up, right } = cameraMoveVectors();
+  const dt = panLastAt === null ? 1 / 60 : Math.min((now - panLastAt) / 1000, 0.05);
+  panLastAt = now;
+  const speed = Math.max(serverStatus.radius * 0.6, serverCamera.distance * 0.3);
+  const step = speed * dt;
+  for (let i = 0; i < 3; i++) {
+    serverCamera.pan[i] += (
+      panDir.f * forward[i] + panDir.u * up[i] + panDir.r * right[i]
+    ) * step;
+  }
   scheduleServerRender(true);
   if (panDir) panRaf = requestAnimationFrame(panTick);
 }
@@ -1241,17 +1282,31 @@ function removePanDir(name) { if (activePanDirs.has(name)) { activePanDirs.delet
 // 导航盘按钮（按住持续移动）
 els.navPad?.querySelectorAll('.nav-btn').forEach((btn) => {
   const dir = btn.dataset.dir;
-  const start = (event) => { event.preventDefault(); if (dir === 'stop') { activePanDirs.clear(); recomputePanDir(); updatePanLoop(); return; } addPanDir(dir); btn.classList.add('pressing'); };
+  const action = btn.dataset.action;
+  const start = (event) => {
+    event.preventDefault();
+    if (action === 'zoom-in') { zoomServerBy(0.82, false); return; }
+    if (action === 'zoom-out') { zoomServerBy(1.22, false); return; }
+    if (dir === 'stop') { activePanDirs.clear(); recomputePanDir(); updatePanLoop(); return; }
+    addPanDir(dir); btn.classList.add('pressing');
+  };
   const end = () => { btn.classList.remove('pressing'); removePanDir(dir); };
   btn.addEventListener('pointerdown', start);
   window.addEventListener('pointerup', end);
   btn.addEventListener('pointercancel', end);
 });
-// 键盘：WASD / 方向键
-const keyToDir = { w: 'up', arrowup: 'up', s: 'down', arrowdown: 'down', a: 'left', arrowleft: 'left', d: 'right', arrowright: 'right' };
+// 键盘：W/S 前后、A/D 左右、Q/E 下上；方向键兼容前后左右。
+const keyToDir = {
+  w: 'forward', arrowup: 'forward', s: 'backward', arrowdown: 'backward',
+  a: 'left', arrowleft: 'left', d: 'right', arrowright: 'right',
+  q: 'fall', pagedown: 'fall', e: 'rise', pageup: 'rise'
+};
 window.addEventListener('keydown', (event) => {
   if (/^(input|select|textarea)$/i.test(event.target.tagName || '')) return;
-  const dir = keyToDir[event.key.toLowerCase()];
+  const key = event.key.toLowerCase();
+  if ((key === '+' || key === '=') && renderLocation === 'server') { event.preventDefault(); zoomServerBy(0.82, false); return; }
+  if ((key === '-' || key === '_') && renderLocation === 'server') { event.preventDefault(); zoomServerBy(1.22, false); return; }
+  const dir = keyToDir[key];
   if (dir) { event.preventDefault(); addPanDir(dir); }
 });
 window.addEventListener('keyup', (event) => { const dir = keyToDir[event.key.toLowerCase()]; if (dir) removePanDir(dir); });

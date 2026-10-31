@@ -1172,6 +1172,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                     stream.write(chunk)
                     remaining -= len(chunk)
             metadata = self.app.state.load(destination)
+            # Keep the collision-safe UUID on disk, but expose the original
+            # user-facing filename in status responses and the viewer UI.
+            metadata["name"] = filename
         except Exception:
             destination.unlink(missing_ok=True)
             raise

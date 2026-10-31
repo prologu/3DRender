@@ -78,7 +78,7 @@ ssh -N -L 18088:127.0.0.1:8088 A5000-tailscale-ljq
 
 页面右上角可切换“本地渲染 / 大场景流式 / 服务端渲染”。大场景模式可以选择一个含有单个 `.rad` 和配套 `.radc` 分块的文件夹、选择多个文件、拖放，或填写已有场景 URL；上传后页面会自动打开场景，服务端通过 HTTP Range 按需返回分块，不要求 CUDA 或 ROCm。
 
-服务端模式将标准 3DGS PLY 上传到 gsplat API，由 PyTorch GPU 后端渲染 JPEG 帧；NVIDIA/CUDA 是稳定路径，RX 7700 XT/ROCm 是实验路径。浏览器通过拖动、滚轮、背景和画质控件更新相机，拖动期间使用 preview LOD，停止后自动细化。帧流优先走同一条双向 WebSocket，代理不支持时自动回退 MJPEG。
+服务端模式将标准 3DGS PLY 上传到 gsplat API，由 PyTorch GPU 后端渲染 JPEG 帧；NVIDIA/CUDA 是稳定路径，RX 7700 XT/ROCm 是实验路径。默认源码部署会从查看器 `8088` 自动连接同主机 GPU API `8090`。左键可进行无俯仰锁定的 360° 旋转，右键拖动平移；`W/S` 前后、`A/D` 左右、`E/Q` 上下，滚轮或 `+/-` 缩放，左下导航盘也提供完整控制。拖动期间使用 preview LOD，停止后自动细化。帧流优先走同一条双向 WebSocket，代理不支持时自动回退 MJPEG。
 
 本地测试默认端口：
 
