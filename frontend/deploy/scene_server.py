@@ -39,6 +39,37 @@ def safe_relative_path(raw: str) -> Path:
 class SceneHandler(SimpleHTTPRequestHandler):
     server_version = "LumaSceneServer/1.0"
 
+    def end_headers(self) -> None:
+        path = urlsplit(self.path).path
+        if path.startswith("/assets/"):
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            self.send_header("Vary", "Accept-Encoding")
+        elif path == "/" or path.endswith("/index.html"):
+            self.send_header("Cache-Control", "no-cache")
+        super().end_headers()
+
+    def send_head(self):
+        """Prefer build-time gzip for hashed assets; retain normal Range behavior."""
+        path = urlsplit(self.path).path
+        accepts_gzip = "gzip" in self.headers.get("Accept-Encoding", "").lower()
+        if path.startswith("/assets/") and accepts_gzip and not self.headers.get("Range"):
+            original = Path(self.translate_path(path))
+            compressed = Path(f"{original}.gz")
+            if original.is_file() and compressed.is_file():
+                try:
+                    source = compressed.open("rb")
+                except OSError:
+                    return super().send_head()
+                details = compressed.stat()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", mimetypes.guess_type(original.name)[0] or "application/octet-stream")
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Length", str(details.st_size))
+                self.send_header("Last-Modified", self.date_time_string(details.st_mtime))
+                self.end_headers()
+                return source
+        return super().send_head()
+
     @property
     def scene_root(self) -> Path:
         return self.server.scene_root  # type: ignore[attr-defined]

@@ -12,6 +12,8 @@
 
 大场景模式使用 Spark 的预构建 LoD 树和共享 LRU page pool。场景总量可以远大于浏览器显存，实际显存只保留当前视角需要的 4M/8M Gaussian 工作集（移动端默认更低），并通过 `.RADC` 分块并行预取。该模式与 CityGS 的 Spark 路线兼容，但代码完全位于本仓库，没有修改 `citygs-spark-docker`。
 
+页面会按模型规模智能选择本地路径：PLY 头中的 `element vertex`（或 `.splat` 文件长度）不超过设备阈值时使用高画质直接渲染；超过阈值时自动切换到 Spark，在浏览器 Web Worker 中构建自适应 LoD，模型仍不上传。默认阈值按 `navigator.deviceMemory` 为 1M/2M/3M，可在页面加载前用 `window.LUMA_DIRECT_SPLAT_LIMIT` 覆盖。预构建 `.RAD/.RADC` 仍是超大场景和生产发布的首选，因为它支持真正的 HTTP Range/分块按需下载，而浏览器现场构建 LoD 仍需先读取整个源文件。
+
 `yaw` 与 `pitch` 均支持连续 360° 轨道旋转；前后端使用在天顶/天底仍良定义的解析相机基。**左键拖动 = 旋转**、**右键拖动 = 屏幕平面移动**、**滚轮 = 缩放**；导航盘和 `WASD`/方向键也沿屏幕轴移动。高斯加载量滑杆实时设置点数比例上限，完整模型常驻 GPU 的硬上限与 out-of-core 路线见 [大规模场景路线](docs/LARGE_SCENES.md)。多个会话使用独立 PyTorch GPU stream；客户端混合粗模预览默认关闭，需要时用 `USE_HYBRID_PREVIEW=true` 开启。
 
 ## 目录
@@ -94,13 +96,18 @@ PORT=8088 bash ./deploy/run-viewer.sh
 
 脚本会优先使用部署包中的 `deploy/site/`，否则使用源码构建出的 `dist/`；也可通过 `SITE_DIR=/absolute/site` 指定目录。它还会启动不依赖 GPU 的场景上传服务，并从 `SCENE_DIR`（默认 `deploy/scenes/`）提供支持 HTTP Range 的分页资源；`MAX_SCENE_GIB` 默认允许单场景 100 GiB。
 
+`npm run build` 会同时为 JS/CSS/WASM 生成 `.gz`，内置场景服务对浏览器自动返回 gzip，并对带内容哈希的 `/assets/` 设置一年 immutable 缓存。Spark 大场景运行包原始约 2.70 MiB、gzip 后约 0.94 MiB；慢速 Tailscale 首次访问仍可能需要数十秒，之后由浏览器缓存复用。同机或局域网访问不受远端隧道吞吐限制。
+
 ### 大场景分页模式
 
-在右上角选择“**大场景流式**”后有三种入口，推荐第一种：
+在右上角选择“**大场景流式**”后有四种入口。按以下规模选择即可：
 
-1. 点击“选择整个场景文件夹”，选择包含一个 `.rad` 和全部 `.radc` 分块的目录；页面上传后自动打开。
-2. 点击“选择 RAD/RADC 文件”，一次多选入口和全部分块；也可以把这一组文件拖到页面。
-3. 已有对象存储或静态资源地址时，仍可直接填写 `.rad` URL。
+1. **数十万到低百万点**：通常直接留在“本地渲染”，拖入 PLY/SPZ；这是帧率和画质最好的路径。
+2. **数百万到约 3000 万点的一次性查看**：点击“直接打开 PLY/SPZ”。Spark 在浏览器后台生成 LoD，不上传文件；内存不足时应改用下一项。
+3. **千万点以上、城市级或需要反复访问**：点击“选择整个场景文件夹”，选择包含一个 `.rad` 和全部 `.radc` 分块的目录；页面上传后自动打开。也可以一次多选 RAD/RADC 或直接拖放整组文件。
+4. **已经发布的场景**：填写 `.rad` HTTP(S) URL。资源服务器必须支持 Range；跨域部署还必须允许 CORS。
+
+浏览器现场 LoD 和分页流不是同一件事：前者免转换但仍需完整读取源文件，后者只下载当前视角所需 `.radc` 块，可让场景总规模远大于终端显存。Spark 官方给出的现场 LoD 经验上限约 3000 万输入 splat；生产超大场景应离线执行 `build-lod --quality --rad-chunked`。
 
 上传入口要求站点由 `frontend/deploy/run-viewer.sh` 启动；`npm run preview` 只提供静态页面，不能接收上传。上传目录可持久化到单独数据盘：
 
@@ -308,6 +315,17 @@ npm run test:server-performance
 
 当前 RX 7700 XT + Tailscale 链路用 1,200 Gaussian 回归夹具实测：修复前 5.43 秒连续拖动仅收到 1 帧（0.2 FPS、E2E 约 3.9 秒）；低码率但单帧确认时为 3.9 FPS；启用有界流水后，同类测试稳定在约 23–26 FPS（页面持续阶段约 25–28 FPS、中位帧间隔约 23–30 ms、GPU 约 3–5 ms）。测试脚本默认以 **20 FPS** 为回归下限；该数字用于验证传输管线，不代表大模型的 GPU 上限。
 
+2026-10-31 规模基准（确定性城市体，持续环绕相机；浏览器视口 1280×720）：
+
+| Gaussian 数 | 浏览器本地（GTX 1650 Ti） | RX 7700 XT 服务端 800×450 | 服务端峰值分配 |
+|---:|---:|---:|---:|
+| 100K | 75.0 FPS | 222.0 FPS / 4.5 ms | 25.6 MiB |
+| 500K | 74.7 FPS | 126.7 FPS / 7.9 ms | 90.9 MiB |
+| 1M | 73.5–74.2 FPS（3 次） | 78.1 FPS / 12.8 ms | 182.5 MiB |
+| 2M | 71.6 FPS（加载 7.9 s） | — | — |
+
+这组数据说明百万点不应默认走远程逐帧 JPEG：本地 GPU 已能稳定交互，而且没有 RTT/带宽成本。当前 gsplat HIP/RDNA3 组合还有一个反直觉特征：1M 全量点在 256×144 为 27.9 FPS，在 512×288、640×360、800×450 分别为 57.6、73.4、约 78 FPS；极小画布进入了低效内核路径。因此中等链路档在模型达到 750K 后改用 512×288；但最差链路档仍使用 256×144，因为此时传输字节而非 GPU 是硬约束。当前约 27 KiB/s 的 Tailscale 上，512×288（约 3.4 KiB/帧）在线仅 6.5 FPS、E2E 约 2.76 秒，即使 GPU 只需 19 ms；这类连接要获得高帧率应使用浏览器本地/分页模型流或更换局域网链路，继续压榨逐帧 JPEG 无法突破带宽上限。
+
 若页面只有 1 FPS，先看 `GPU xx ms` 和 `E2E xx ms`：GPU 约 10–30 ms、E2E 却数百到数千毫秒，说明驱动和 ROCm 正常，瓶颈位于传输。可分别检查延迟和 32 KiB 实际吞吐：
 
 ```bash
@@ -420,6 +438,14 @@ EXPECTED_MODEL=model.ply \
 npm run test:server
 npm run test:stream    # 快速拖动、背压、松手最终帧延迟
 npm run test:mjpeg     # 禁用 WebSocket 后验证自动降级与会话释放
+npm run test:local-lod # 本地 PLY -> 浏览器 LoD + 自动分流，不上传服务器
+
+# 生成 100K/500K/1M 基准并测试当前浏览器 GPU
+npm run benchmark:generate
+npm run benchmark:local
+
+# 在 GPU 服务器本机测试 API（排除网络传输）
+python3 ../server/benchmark_api.py tests/generated/benchmark-1000000.ply
 
 # 可选：明确验证高清 100% 或性能 50% 在旋转期间点数恒定
 QUALITY=high LOD_PERCENT=100 npm run test:stream

@@ -65,11 +65,12 @@ export class PagedSceneViewer {
     this.raf = requestAnimationFrame(this.loop);
   }
 
-  async load(url) {
+  async load(url, { paged = true, name = null } = {}) {
     this.url = url;
+    this.localLod = !paged;
     this.mesh = new SplatMesh({
       url,
-      paged: true,
+      ...(paged ? { paged: true } : { lod: true }),
       onProgress: (event) => {
         const percent = event.lengthComputable && event.total > 0
           ? event.loaded * 100 / event.total
@@ -85,11 +86,18 @@ export class PagedSceneViewer {
     this.fitToScene();
     this.onProgress?.(100);
     this.onReady?.({
-      name: decodeURIComponent(new URL(url, window.location.href).pathname.split('/').pop() || 'scene.rad'),
-      maxPagedSplats: this.spark.maxPagedSplats,
-      activeSplats: this.spark.activeSplats
+      name: name || decodeURIComponent(new URL(url, window.location.href).pathname.split('/').pop() || 'scene.rad'),
+      maxPagedSplats: paged ? this.spark.maxPagedSplats : (this.spark.lodSplatCount || 2_500_000),
+      activeSplats: this.spark.activeSplats,
+      localLod: !paged
     });
     this.requestRender(20);
+  }
+
+  async loadFile(file) {
+    if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
+    this.objectUrl = URL.createObjectURL(file);
+    await this.load(this.objectUrl, { paged: false, name: file.name });
   }
 
   fitToScene() {
@@ -209,6 +217,7 @@ export class PagedSceneViewer {
     this.scene.remove(this.spark);
     this.spark.dispose();
     this.renderer.dispose();
+    if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
     this.root.replaceChildren();
   }
 }

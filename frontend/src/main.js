@@ -1,6 +1,7 @@
 import './styles.css';
 
 let GaussianSplats3D = null;
+let PagedSceneViewerClass = null;
 
 const $ = (selector) => document.querySelector(selector);
 const els = {
@@ -18,7 +19,8 @@ const els = {
   renderModeLabel: $('#renderModeLabel'), privacyTitle: $('#privacyTitle'), privacyText: $('#privacyText'),
   lodSlider: $('#lodSlider'), lodValue: $('#lodValue'), navPad: $('#navPad'), streamSource: $('#streamSource'),
   streamUrl: $('#streamUrl'), openFileLabel: $('#openFileLabel'), sceneFileInput: $('#sceneFileInput'),
-  sceneFolderInput: $('#sceneFolderInput'), selectSceneFiles: $('#selectSceneFiles'),
+  sceneFolderInput: $('#sceneFolderInput'), selectSceneFiles: $('#selectSceneFiles'), lodFileInput: $('#lodFileInput'),
+  selectLodFile: $('#selectLodFile'),
   selectSceneFolder: $('#selectSceneFolder'), dragOverlayText: $('#dragOverlayText')
 };
 
@@ -164,6 +166,12 @@ function backgroundRgb() {
 function serverResolution(interactive = false) {
   if (interactive) {
     const performanceMode = els.qualitySelect.value === 'performance';
+    // gsplat/HIP on RDNA3 is projection-bound for large full-LOD models. In
+    // measured runs 1M points rendered faster at 512p than 256p (57.6 vs
+    // 27.9 FPS), so do not enter the tiny-canvas kernel path for large models.
+    if ((serverStatus?.gaussians || 0) >= 750_000 && serverInteractiveTier === 1) {
+      return { width: 512, height: 288 };
+    }
     const profiles = performanceMode
       ? [{ width: 480, height: 270 }, { width: 400, height: 225 }, { width: 256, height: 144 }]
       : [{ width: 640, height: 360 }, { width: 400, height: 225 }, { width: 256, height: 144 }];
@@ -990,6 +998,82 @@ async function loadPagedScene(value) {
   }
 }
 
+async function inspectLocalModel(file) {
+  const extension = getExtension(file.name);
+  if (extension === 'splat') return { extension, gaussians: Math.floor(file.size / 32) };
+  if (extension !== 'ply') return { extension, gaussians: null };
+  const header = await file.slice(0, Math.min(file.size, 256 * 1024)).text();
+  const end = header.indexOf('end_header');
+  if (end < 0) return { extension, gaussians: null };
+  const match = header.slice(0, end).match(/element\s+vertex\s+(\d+)/i);
+  return { extension, gaussians: match ? Number(match[1]) : null };
+}
+
+function localDirectThreshold() {
+  const configured = Number(window.LUMA_DIRECT_SPLAT_LIMIT);
+  if (Number.isFinite(configured) && configured > 0) return configured;
+  const memory = Number(navigator.deviceMemory || 8);
+  if (memory <= 4) return 1_000_000;
+  if (memory <= 8) return 2_000_000;
+  return 3_000_000;
+}
+
+function createPagedSceneViewer(sourceLabel, localMeta = null) {
+  return new PagedSceneViewerClass({
+    root: els.viewport,
+    background: els.backgroundSelect.value,
+    quality: els.qualitySelect.value,
+    onProgress: setProgress,
+    onStats: ({ fps, activeSplats, maxPagedSplats }) => {
+      if (renderLocation !== 'paged') return;
+      els.fpsValue.textContent = fps || '—';
+      els.splatCount.textContent = `${formatCount(activeSplats)} / ${formatCount(maxPagedSplats)}`;
+    },
+    onReady: ({ name, maxPagedSplats, activeSplats, localLod }) => {
+      activeFile = { name, extension: localLod ? localMeta?.extension : 'rad', paged: !localLod, localLod, url: sourceLabel };
+      els.fileName.textContent = name;
+      els.fileType.textContent = localLod ? `${(localMeta?.extension || 'PLY').toUpperCase()} · LOD` : 'RAD';
+      els.fileSize.textContent = localLod
+        ? `${formatBytes(localMeta?.size || 0)} · 浏览器后台 LoD`
+        : `按需分页 · 缓存上限 ${formatCount(maxPagedSplats)}`;
+      els.splatCount.textContent = localLod && localMeta?.gaussians
+        ? `${formatCount(activeSplats)} / ${formatCount(localMeta.gaussians)}`
+        : `${formatCount(activeSplats)} / ${formatCount(maxPagedSplats)}`;
+    }
+  });
+}
+
+async function loadLocalLodFile(file, inspected = null) {
+  if (!file || file.size === 0) return showToast('文件为空，无法加载', true);
+  const metadata = inspected || await inspectLocalModel(file);
+  if (!clientFormats.has(metadata.extension)) return showToast('浏览器 LoD 仅支持 PLY、SPLAT、KSPLAT 和 SPZ', true);
+  if (renderLocation !== 'paged') await switchMode('paged');
+  showLoading('正在构建浏览器 LoD', '首次处理在本机后台完成；文件不会上传服务器');
+  setProgress(0);
+  disposePagedViewer();
+  try {
+    ({ PagedSceneViewer: PagedSceneViewerClass } = await import('./paged-viewer.js'));
+    pagedViewer = createPagedSceneViewer(file.name, { ...metadata, name: file.name, size: file.size });
+    window.__lumaPagedViewer = pagedViewer;
+    await pagedViewer.loadFile(file);
+    els.viewport.classList.add('ready');
+    els.welcome.classList.add('hidden');
+    els.modelPanel.classList.add('visible');
+    els.toolbar.classList.add('visible');
+    els.controlHint.classList.add('visible');
+    els.navPad.classList.remove('visible');
+    hideLoading();
+    history.replaceState(null, '', location.pathname);
+    showToast(`${file.name} 已在浏览器中构建自适应 LoD`);
+  } catch (error) {
+    console.error(error);
+    disposePagedViewer();
+    hideLoading();
+    els.welcome.classList.remove('hidden');
+    showToast(`浏览器 LoD 构建失败：${readableError(error)}`, true);
+  }
+}
+
 async function loadScene(source, metadata, extension, skipDispose = false) {
   if (!hasWebGL2()) return showToast('当前浏览器不支持 WebGL 2', true);
   showLoading(metadata.demo ? '正在打开示例场景' : '正在读取模型');
@@ -1057,6 +1141,12 @@ async function handleFile(file) {
   const extension = getExtension(file.name);
   if (!clientFormats.has(extension)) return showToast('仅支持 .ply、.splat、.ksplat 和 .spz 文件', true);
   if (file.size === 0) return showToast('文件为空，无法加载', true);
+  const inspected = await inspectLocalModel(file);
+  if (inspected.gaussians && inspected.gaussians > localDirectThreshold()) {
+    showToast(`${formatCount(inspected.gaussians)} 点超过本机直接渲染阈值，已切换浏览器 LoD`);
+    await loadLocalLodFile(file, inspected);
+    return;
+  }
   await disposeViewer();
   objectUrl = URL.createObjectURL(file);
   await loadScene(objectUrl, { name: file.name, size: file.size, extension }, extension, true);
@@ -1168,6 +1258,8 @@ els.streamSource.addEventListener('submit', (event) => {
 });
 els.selectSceneFiles.addEventListener('click', () => els.sceneFileInput.click());
 els.selectSceneFolder.addEventListener('click', () => els.sceneFolderInput.click());
+els.selectLodFile.addEventListener('click', () => els.lodFileInput.click());
+els.lodFileInput.addEventListener('change', () => { void loadLocalLodFile(els.lodFileInput.files[0]); els.lodFileInput.value = ''; });
 els.sceneFileInput.addEventListener('change', () => { void uploadPagedScene(els.sceneFileInput.files); els.sceneFileInput.value = ''; });
 els.sceneFolderInput.addEventListener('change', () => { void uploadPagedScene(els.sceneFolderInput.files); els.sceneFolderInput.value = ''; });
 els.togglePanel.addEventListener('click', () => setPanel(!els.modelPanel.classList.contains('visible')));
@@ -1210,7 +1302,9 @@ window.addEventListener('drop', (event) => {
   event.preventDefault();
   dragDepth = 0;
   els.dragOverlay.classList.remove('visible');
-  if (renderLocation === 'paged') void uploadPagedScene(event.dataTransfer.files);
+  if (renderLocation === 'paged' && event.dataTransfer.files.length === 1 && clientFormats.has(getExtension(event.dataTransfer.files[0].name))) {
+    void loadLocalLodFile(event.dataTransfer.files[0]);
+  } else if (renderLocation === 'paged') void uploadPagedScene(event.dataTransfer.files);
   else handleFile(event.dataTransfer.files[0]);
 });
 

@@ -59,10 +59,11 @@
           </div>
           <div class="stream-divider"><span>或者从本机上传</span></div>
           <div class="stream-upload-row">
+            <button id="selectLodFile" class="button button-secondary" type="button">直接打开 PLY/SPZ</button>
             <button id="selectSceneFiles" class="button button-secondary" type="button">选择 RAD/RADC 文件</button>
             <button id="selectSceneFolder" class="button button-secondary" type="button">选择整个场景文件夹</button>
           </div>
-          <small><b>最简单：</b>选择包含一个 .RAD 索引和配套 .RADC 分块的文件夹，上传完成后会自动加载。也可拖放整组文件。</small>
+          <small><b>数十万/百万点：</b>直接选择 PLY/SPZ，浏览器后台构建 LoD，不上传服务器。<b>千万点及任意总规模：</b>选择包含一个 .RAD 索引和配套 .RADC 分块的文件夹，按视角流式加载。</small>
         </form>
         <button id="loadDemo" class="text-button" type="button">没有模型？体验内置示例 <span>→</span></button>
       </section>
@@ -155,6 +156,7 @@
 
       <div id="toast" class="toast" role="alert"></div>
       <input id="fileInput" type="file" accept=".ply,.splat,.ksplat,.spz" hidden />
+      <input id="lodFileInput" type="file" accept=".ply,.splat,.ksplat,.spz" hidden />
       <input id="sceneFileInput" type="file" accept=".rad,.radc" multiple hidden />
       <input id="sceneFolderInput" type="file" accept=".rad,.radc" webkitdirectory multiple hidden />
     </main>

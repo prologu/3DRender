@@ -2,6 +2,7 @@
 import http.client
 import importlib.util
 import json
+import gzip
 import tempfile
 import threading
 from functools import partial
@@ -29,6 +30,11 @@ with tempfile.TemporaryDirectory() as temporary:
     site.mkdir()
     scenes.mkdir()
     (site / "index.html").write_text("viewer", encoding="utf-8")
+    assets = site / "assets"
+    assets.mkdir()
+    script = b"console.log('large scene viewer');" * 100
+    (assets / "index-hash.js").write_bytes(script)
+    (assets / "index-hash.js.gz").write_bytes(gzip.compress(script, compresslevel=9))
     handler = partial(MODULE.SceneHandler, directory=str(site))
     server = MODULE.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     server.scene_root = scenes
@@ -52,9 +58,15 @@ with tempfile.TemporaryDirectory() as temporary:
         )
         assert status == 206 and payload == b"2345", (status, payload)
         assert headers["Accept-Ranges"] == "bytes"
+        status, headers, payload = request(
+            connection, "GET", "/assets/index-hash.js", headers={"Accept-Encoding": "gzip"}
+        )
+        assert status == 200 and headers["Content-Encoding"] == "gzip", (status, headers)
+        assert gzip.decompress(payload) == script
+        assert "immutable" in headers["Cache-Control"]
         status, _, payload = request(connection, "GET", "/api/health")
         assert status == 200 and json.loads(payload)["uploads"] is True
-        print(json.dumps({"ok": True, "range": "2-5/10", "scene": scene["id"]}))
+        print(json.dumps({"ok": True, "range": "2-5/10", "gzip": True, "scene": scene["id"]}))
     finally:
         connection.close()
         server.shutdown()
