@@ -1,0 +1,512 @@
+{
+  "created_utc": "2026-11-16T05:43:11.550975+00:00",
+  "api": "http://127.0.0.1:8090",
+  "status": {
+    "ok": true,
+    "backend": "gsplat",
+    "torch": "2.5.0",
+    "cuda": "12.4",
+    "hip": null,
+    "platform": "cuda",
+    "device": "NVIDIA RTX A6000",
+    "physical_gpu": 0,
+    "memory_fraction": 0.85,
+    "gpu": {
+      "used_mib": 716,
+      "free_mib": 47960,
+      "total_mib": 49140,
+      "util_percent": 0
+    },
+    "model": {
+      "name": "point_cloud.ply",
+      "bytes": 1309050647,
+      "gaussians": 7982010,
+      "bounds_min": [
+        -360.5736389160156,
+        -5.423460960388184,
+        -273.8076477050781
+      ],
+      "bounds_max": [
+        274.47021484375,
+        466.1523742675781,
+        656.5191040039062
+      ],
+      "center": [
+        -43.05171203613281,
+        230.3644561767578,
+        191.35572814941406
+      ],
+      "radius": 610.56787109375,
+      "median_scale": 0.05156852304935455,
+      "camera": {
+        "yaw": 0.0,
+        "pitch": 0.0,
+        "distance": 1587.4764648437501
+      },
+      "lod_levels": {
+        "preview": 1995502,
+        "balanced": 4390105,
+        "full": 7982010
+      }
+    },
+    "model_generation": 1,
+    "capabilities": {
+      "adaptive_lod": true,
+      "mjpeg_stream": true,
+      "websocket_stream": true,
+      "h264_fmp4": true,
+      "webrtc_stream": true,
+      "latest_camera_wins": true,
+      "spatial_lod": false,
+      "stream_concurrency": 4
+    },
+    "sessions": {
+      "active": 0,
+      "streams": 0,
+      "limit": 4,
+      "ttl_seconds": 120
+    }
+  },
+  "performance": [
+    {
+      "profile": {
+        "name": "450p-lod10-q60",
+        "width": 800,
+        "height": 450,
+        "lod": 0.1,
+        "jpeg_quality": 60,
+        "interactive": true
+      },
+      "summary": {
+        "gaussians": 798201,
+        "lod": "0.10",
+        "render_ms": {
+          "median": 18.97,
+          "p95": 21.798
+        },
+        "gpu_ms": {
+          "median": 10.23,
+          "p95": 13.573
+        },
+        "encode_ms": {
+          "median": 8.195,
+          "p95": 8.322
+        },
+        "wall_ms": {
+          "median": 20.804,
+          "p95": 24.063
+        },
+        "render_fps": 52.71,
+        "local_delivery_fps": 48.07,
+        "jpeg_kib": 10.91,
+        "peak_allocated_mib": 528.6,
+        "peak_reserved_mib": 918.0
+      }
+    },
+    {
+      "profile": {
+        "name": "450p-lod25-q70",
+        "width": 800,
+        "height": 450,
+        "lod": 0.25,
+        "jpeg_quality": 70,
+        "interactive": true
+      },
+      "summary": {
+        "gaussians": 1995502,
+        "lod": "0.25",
+        "render_ms": {
+          "median": 29.0,
+          "p95": 36.185
+        },
+        "gpu_ms": {
+          "median": 22.455,
+          "p95": 29.504
+        },
+        "encode_ms": {
+          "median": 6.15,
+          "p95": 6.226
+        },
+        "wall_ms": {
+          "median": 30.54,
+          "p95": 37.863
+        },
+        "render_fps": 34.48,
+        "local_delivery_fps": 32.74,
+        "jpeg_kib": 11.78,
+        "peak_allocated_mib": 679.4,
+        "peak_reserved_mib": 1606.0
+      }
+    },
+    {
+      "profile": {
+        "name": "720p-lod25-q70",
+        "width": 1280,
+        "height": 720,
+        "lod": 0.25,
+        "jpeg_quality": 70,
+        "interactive": true
+      },
+      "summary": {
+        "gaussians": 1995502,
+        "lod": "0.25",
+        "render_ms": {
+          "median": 33.25,
+          "p95": 34.165
+        },
+        "gpu_ms": {
+          "median": 16.45,
+          "p95": 17.639
+        },
+        "encode_ms": {
+          "median": 16.095,
+          "p95": 16.593
+        },
+        "wall_ms": {
+          "median": 34.884,
+          "p95": 35.955
+        },
+        "render_fps": 30.08,
+        "local_delivery_fps": 28.67,
+        "jpeg_kib": 25.34,
+        "peak_allocated_mib": 684.6,
+        "peak_reserved_mib": 1814.0
+      }
+    },
+    {
+      "profile": {
+        "name": "720p-lod55-q80",
+        "width": 1280,
+        "height": 720,
+        "lod": 0.55,
+        "jpeg_quality": 80,
+        "interactive": true
+      },
+      "summary": {
+        "gaussians": 4390105,
+        "lod": "0.55",
+        "render_ms": {
+          "median": 52.36,
+          "p95": 53.235
+        },
+        "gpu_ms": {
+          "median": 36.475,
+          "p95": 37.469
+        },
+        "encode_ms": {
+          "median": 15.12,
+          "p95": 15.8
+        },
+        "wall_ms": {
+          "median": 54.595,
+          "p95": 57.929
+        },
+        "render_fps": 19.1,
+        "local_delivery_fps": 18.32,
+        "jpeg_kib": 28.19,
+        "peak_allocated_mib": 980.8,
+        "peak_reserved_mib": 3862.0
+      }
+    },
+    {
+      "profile": {
+        "name": "720p-full-q90",
+        "width": 1280,
+        "height": 720,
+        "lod": 1.0,
+        "jpeg_quality": 90,
+        "interactive": false
+      },
+      "summary": {
+        "gaussians": 7982010,
+        "lod": "1.00",
+        "render_ms": {
+          "median": 76.365,
+          "p95": 78.858
+        },
+        "gpu_ms": {
+          "median": 60.48,
+          "p95": 62.848
+        },
+        "encode_ms": {
+          "median": 15.39,
+          "p95": 15.466
+        },
+        "wall_ms": {
+          "median": 78.893,
+          "p95": 81.806
+        },
+        "render_fps": 13.1,
+        "local_delivery_fps": 12.68,
+        "jpeg_kib": 34.56,
+        "peak_allocated_mib": 1426.8,
+        "peak_reserved_mib": 7558.0
+      }
+    },
+    {
+      "profile": {
+        "name": "1080p-lod55-q88",
+        "width": 1920,
+        "height": 1080,
+        "lod": 0.55,
+        "jpeg_quality": 88,
+        "interactive": false
+      },
+      "summary": {
+        "gaussians": 4390105,
+        "lod": "0.55",
+        "render_ms": {
+          "median": 58.105,
+          "p95": 60.931
+        },
+        "gpu_ms": {
+          "median": 22.09,
+          "p95": 24.458
+        },
+        "encode_ms": {
+          "median": 35.365,
+          "p95": 35.781
+        },
+        "wall_ms": {
+          "median": 60.097,
+          "p95": 63.186
+        },
+        "render_fps": 17.21,
+        "local_delivery_fps": 16.64,
+        "jpeg_kib": 64.56,
+        "peak_allocated_mib": 984.1,
+        "peak_reserved_mib": 7558.0
+      }
+    },
+    {
+      "profile": {
+        "name": "1080p-full-q92",
+        "width": 1920,
+        "height": 1080,
+        "lod": 1.0,
+        "jpeg_quality": 92,
+        "interactive": false
+      },
+      "summary": {
+        "gaussians": 7982010,
+        "lod": "1.00",
+        "render_ms": {
+          "median": 73.68,
+          "p95": 76.678
+        },
+        "gpu_ms": {
+          "median": 35.395,
+          "p95": 37.583
+        },
+        "encode_ms": {
+          "median": 36.73,
+          "p95": 39.286
+        },
+        "wall_ms": {
+          "median": 79.48,
+          "p95": 82.124
+        },
+        "render_fps": 13.57,
+        "local_delivery_fps": 12.58,
+        "jpeg_kib": 71.43,
+        "peak_allocated_mib": 1427.4,
+        "peak_reserved_mib": 7558.0
+      }
+    }
+  ],
+  "quality_reference": "same camera, 1280x720, JPEG quality 95, full loaded point set",
+  "quality_samples": [
+    {
+      "camera": 0,
+      "profile": "lod10",
+      "psnr_db": 45.6848,
+      "ssim": 0.998894,
+      "gaussians": 798201,
+      "jpeg_kib": 45.72,
+      "reference_jpeg_kib": 45.75
+    },
+    {
+      "camera": 0,
+      "profile": "lod25",
+      "psnr_db": 50.4325,
+      "ssim": 0.999532,
+      "gaussians": 1995502,
+      "jpeg_kib": 45.77,
+      "reference_jpeg_kib": 45.75
+    },
+    {
+      "camera": 0,
+      "profile": "lod55",
+      "psnr_db": 58.0814,
+      "ssim": 0.99989,
+      "gaussians": 4390105,
+      "jpeg_kib": 45.75,
+      "reference_jpeg_kib": 45.75
+    },
+    {
+      "camera": 1,
+      "profile": "lod10",
+      "psnr_db": 46.6614,
+      "ssim": 0.998939,
+      "gaussians": 798201,
+      "jpeg_kib": 46.3,
+      "reference_jpeg_kib": 46.31
+    },
+    {
+      "camera": 1,
+      "profile": "lod25",
+      "psnr_db": 51.9011,
+      "ssim": 0.999576,
+      "gaussians": 1995502,
+      "jpeg_kib": 46.31,
+      "reference_jpeg_kib": 46.31
+    },
+    {
+      "camera": 1,
+      "profile": "lod55",
+      "psnr_db": 58.76,
+      "ssim": 0.999885,
+      "gaussians": 4390105,
+      "jpeg_kib": 46.32,
+      "reference_jpeg_kib": 46.31
+    },
+    {
+      "camera": 2,
+      "profile": "lod10",
+      "psnr_db": 48.0957,
+      "ssim": 0.999208,
+      "gaussians": 798201,
+      "jpeg_kib": 40.84,
+      "reference_jpeg_kib": 40.85
+    },
+    {
+      "camera": 2,
+      "profile": "lod25",
+      "psnr_db": 53.1425,
+      "ssim": 0.999689,
+      "gaussians": 1995502,
+      "jpeg_kib": 40.85,
+      "reference_jpeg_kib": 40.85
+    },
+    {
+      "camera": 2,
+      "profile": "lod55",
+      "psnr_db": 59.5624,
+      "ssim": 0.999908,
+      "gaussians": 4390105,
+      "jpeg_kib": 40.88,
+      "reference_jpeg_kib": 40.85
+    },
+    {
+      "camera": 3,
+      "profile": "lod10",
+      "psnr_db": 51.538,
+      "ssim": 0.999618,
+      "gaussians": 798201,
+      "jpeg_kib": 34.54,
+      "reference_jpeg_kib": 34.54
+    },
+    {
+      "camera": 3,
+      "profile": "lod25",
+      "psnr_db": 55.9147,
+      "ssim": 0.999837,
+      "gaussians": 1995502,
+      "jpeg_kib": 34.53,
+      "reference_jpeg_kib": 34.54
+    },
+    {
+      "camera": 3,
+      "profile": "lod55",
+      "psnr_db": 62.2981,
+      "ssim": 0.999952,
+      "gaussians": 4390105,
+      "jpeg_kib": 34.54,
+      "reference_jpeg_kib": 34.54
+    },
+    {
+      "camera": 4,
+      "profile": "lod10",
+      "psnr_db": 50.0109,
+      "ssim": 0.999477,
+      "gaussians": 798201,
+      "jpeg_kib": 42.37,
+      "reference_jpeg_kib": 42.39
+    },
+    {
+      "camera": 4,
+      "profile": "lod25",
+      "psnr_db": 54.5143,
+      "ssim": 0.99978,
+      "gaussians": 1995502,
+      "jpeg_kib": 42.4,
+      "reference_jpeg_kib": 42.39
+    },
+    {
+      "camera": 4,
+      "profile": "lod55",
+      "psnr_db": 60.9264,
+      "ssim": 0.999941,
+      "gaussians": 4390105,
+      "jpeg_kib": 42.38,
+      "reference_jpeg_kib": 42.39
+    },
+    {
+      "camera": 5,
+      "profile": "lod10",
+      "psnr_db": 49.3426,
+      "ssim": 0.999575,
+      "gaussians": 798201,
+      "jpeg_kib": 38.77,
+      "reference_jpeg_kib": 38.81
+    },
+    {
+      "camera": 5,
+      "profile": "lod25",
+      "psnr_db": 53.9035,
+      "ssim": 0.999825,
+      "gaussians": 1995502,
+      "jpeg_kib": 38.81,
+      "reference_jpeg_kib": 38.81
+    },
+    {
+      "camera": 5,
+      "profile": "lod55",
+      "psnr_db": 61.025,
+      "ssim": 0.99995,
+      "gaussians": 4390105,
+      "jpeg_kib": 38.81,
+      "reference_jpeg_kib": 38.81
+    }
+  ],
+  "quality_summary": [
+    {
+      "profile": "lod10",
+      "lod": 0.1,
+      "gaussians": 798201,
+      "psnr_db_mean": 48.5556,
+      "psnr_db_min": 45.6848,
+      "ssim_mean": 0.999285,
+      "ssim_min": 0.998894
+    },
+    {
+      "profile": "lod25",
+      "lod": 0.25,
+      "gaussians": 1995502,
+      "psnr_db_mean": 53.3014,
+      "psnr_db_min": 50.4325,
+      "ssim_mean": 0.999707,
+      "ssim_min": 0.999532
+    },
+    {
+      "profile": "lod55",
+      "lod": 0.55,
+      "gaussians": 4390105,
+      "psnr_db_mean": 60.1089,
+      "psnr_db_min": 58.0814,
+      "ssim_mean": 0.999921,
+      "ssim_min": 0.999885
+    }
+  ],
+  "caveat": "Current renderer converts only f_dc coefficients to RGB and does not evaluate view-dependent SH terms."
+}

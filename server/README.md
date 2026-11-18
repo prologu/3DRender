@@ -41,7 +41,7 @@ PHYSICAL_GPU=3 bash ./run-probe.sh
 
 ## 交互式服务端渲染
 
-服务端使用指定 GPU 和 gsplat 常驻加载标准 3DGS PLY，浏览器只发送轨道相机参数并接收 JPEG 帧：
+服务端使用指定 GPU 和 gsplat 常驻加载标准 3DGS PLY。浏览器可发送轨道相机参数，数据集回放与沉浸式客户端也可直接发送 `view_matrix`/`intrinsics`；图像通过 WebRTC/H.264 为主、JPEG/MJPEG 为兼容回退：
 
 ```bash
 cd /workspace/luma-server-render
@@ -54,7 +54,7 @@ bash ./run-render-server.sh
 默认 API 端口为 `8090`，接口包括：
 
 - `GET /api/status`：GPU、运行环境和当前模型状态
-- `POST /api/render`：按 yaw、pitch、distance、`pan`（世界系平移偏移，前后左右移动，按模型半径×8 截断）、FOV 和分辨率渲染
+- `POST /api/render`：按 yaw、pitch、distance、`pan`（世界系平移偏移，前后左右移动，按模型半径×8 截断）、FOV 和分辨率渲染；也可用 OpenCV 约定的 4×4 world-to-camera `view_matrix` 与输出分辨率对应的 3×3 `intrinsics` 精确回放数据集或 XR 相机
 - `POST /api/model`：以请求体上传 binary little-endian 标准 3DGS PLY
 - `POST /api/session`：创建只保留最新相机状态的交互会话
 - `POST /api/session/{id}/webrtc`：交换 SDP，建立 H.264/RTP 低延迟视频轨
@@ -74,13 +74,15 @@ LOD 选点策略：客户端档位决定每帧 Gaussian 预算，**默认按重�
 
 **前后左右移动（pan）**：`/api/render`、`/api/session`、`/api/session/{id}/camera` 接受 `pan=[x,y,z]`（世界系平移偏移，缺省 `[0,0,0]`），服务端 `center = 模型中心 + pan`，并按模型半径×8 截断，防止移出场景。前端**左键拖动=旋转、右键拖动=移动（屏幕平面平移）**；导航盘/`WASD`/方向键沿连续解析相机基的**屏幕轴**累计 `pan`，步长 `distance×0.02` 随缩放缩放。前端本地预览与服务端 `view_matrix` 使用同一组轴，所以经过任一极点后移动方向仍与画面一致。
 
-**数值 LOD（高斯加载量滑杆）**：`lod` 除接受档位字符串（preview / balanced / full）外，也接受数值（如 `0.5` = 50% 点数），直接作为该帧点数比例上限（clip 到 0.05–1.0）。前端“高斯加载量”滑杆（10%–100%）即下发数值 `lod`，实时选择服务端加载点数比例；服务端自适应 LOD 仍在其之上按帧预算自动降档兜底（大场景满加载效率的双保险）。
+**数值 LOD（高斯加载量滑杆）**：`lod` 除接受档位字符串（preview / balanced / full）外，也接受数值（如 `0.5` = 50% 点数），直接作为该帧点数比例上限（clip 到 0–1，并保留至少 1,000 个 Gaussian）。前端“高斯加载量”滑杆（10%–100%）即下发数值 `lod`，实时选择服务端加载点数比例；交互运动阶段还可使用低于 5% 的绝对点数预算，使千万级场景仍能严格遵守 30/55 万点的前端预算。服务端自适应 LOD 仍在其之上按帧预算自动降档兜底（大场景满加载效率的双保险）。
+**球谐外观**：标准 PLY 含 `f_rest_*` 时，加载器按 3DGS 的 channel-major 字段顺序自动恢复 `[N,K,3]` 系数并推断球谐阶数；gsplat 在每个视角评估方向相关颜色。仅含 `f_dc_*` 的模型继续使用 DC-RGB 兼容路径。`/api/status` 的 `model.color_mode`、`sh_degree` 与 `sh_coefficients` 可用于审计实际路径。
+**精确相机回放**：`view_matrix` 必须为可逆、有限且最后一行为 `[0,0,0,1]` 的 world-to-camera 矩阵；`intrinsics` 必须具有正焦距。两者缺省时仍使用原有轨道相机，因此现有网页不受影响。CityGaussian/Mill-19 的 `cameras.json` 保存 camera-to-world 旋转与位置，取逆后即可作为 `view_matrix`。
 **流统计**：WebSocket 统计 JSON 与 MJPEG 帧头 `X-Render-Stats` 都包含 `lod_auto`、`lod_locked`、`interactive`、`revision`；WebSocket 额外返回 `client_seq` 作为应用层确认。
 
 Docker 未发布端口时，在访问设备建立转发：
 
 ```bash
-ssh -N -L 18090:127.0.0.1:8090 V100-tailscale-ljq
+ssh -N -L 18088:127.0.0.1:8088 -L 18090:127.0.0.1:8090 A6000
 ```
 
 网页从 `http://127.0.0.1:18088` 打开时会自动使用 `http://127.0.0.1:18090` 作为渲染 API。

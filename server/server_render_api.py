@@ -344,6 +344,13 @@ def cpu_arrays_from_ply(path: Path) -> tuple[dict[str, np.ndarray], dict]:
     dc = np.column_stack(
         (vertices["f_dc_0"], vertices["f_dc_1"], vertices["f_dc_2"])
     ).astype(np.float32)
+    rest_names = sorted(
+        (name for name in names if name.startswith("f_rest_")),
+        key=lambda name: int(name.removeprefix("f_rest_")),
+    )
+    rest_flat = None
+    if rest_names:
+        rest_flat = np.column_stack(tuple(vertices[name] for name in rest_names)).astype(np.float32)
     del vertices
 
     for label, values in {
@@ -352,12 +359,29 @@ def cpu_arrays_from_ply(path: Path) -> tuple[dict[str, np.ndarray], dict]:
     }.items():
         if not np.isfinite(values).all():
             raise ValueError(f"{label} 包含 NaN 或 Inf")
+    if rest_flat is not None and not np.isfinite(rest_flat).all():
+        raise ValueError("球谐系数包含 NaN 或 Inf")
 
     scales = np.exp(np.clip(log_scales, -20.0, 8.0)).astype(np.float32)
     opacities = (1.0 / (1.0 + np.exp(-np.clip(opacity_logits, -20.0, 20.0)))).astype(np.float32)
     norms = np.linalg.norm(quats, axis=1, keepdims=True)
     quats = quats / np.clip(norms, 1e-8, None)
-    colors = np.clip(0.5 + SH_C0 * dc, 0.0, 1.0).astype(np.float32)
+    sh_degree = None
+    if rest_flat is not None:
+        if len(rest_names) % 3:
+            raise ValueError("f_rest_* 属性数量必须能被 3 整除")
+        coefficients = len(rest_names) // 3 + 1
+        sh_degree = int(round(math.sqrt(coefficients) - 1))
+        if (sh_degree + 1) ** 2 != coefficients:
+            raise ValueError("f_rest_* 属性数量不是完整的球谐阶数")
+        # Standard 3DGS PLY stores f_rest channel-major after transposing the
+        # internal [N, K-1, 3] tensor to [N, 3, K-1]. Reconstruct the gsplat
+        # [N, K, 3] layout and let the rasterizer evaluate view dependence.
+        rest = rest_flat.reshape(count, 3, coefficients - 1).transpose(0, 2, 1)
+        colors = np.concatenate((dc[:, None, :], rest), axis=1).astype(np.float32)
+        del rest, rest_flat
+    else:
+        colors = np.clip(0.5 + SH_C0 * dc, 0.0, 1.0).astype(np.float32)
 
     bounds_min = means.min(axis=0)
     bounds_max = means.max(axis=0)
@@ -383,6 +407,9 @@ def cpu_arrays_from_ply(path: Path) -> tuple[dict[str, np.ndarray], dict]:
         "center": center.tolist(),
         "radius": radius,
         "median_scale": median_scale,
+        "color_mode": "spherical_harmonics" if sh_degree is not None else "dc_rgb",
+        "sh_degree": sh_degree,
+        "sh_coefficients": (sh_degree + 1) ** 2 if sh_degree is not None else 1,
         "camera": {"yaw": 0.0, "pitch": 0.0, "distance": radius * 2.6},
     }
     return arrays, metadata
@@ -579,7 +606,7 @@ class RendererState:
         levels = self.metadata["lod_levels"]
         requested = request.get("lod", "full")
         if isinstance(requested, (int, float)):
-            fraction = float(np.clip(float(requested), 0.05, 1.0))
+            fraction = float(np.clip(float(requested), 0.0, 1.0))
             count = min(levels["full"], max(1_000, int(levels["full"] * fraction)))
             return count, f"{fraction:.2f}"
         name = str(requested).lower()
@@ -587,13 +614,19 @@ class RendererState:
             name = "full"
         return levels[name], name
 
+    def minimum_lod_fraction(self) -> float:
+        """Smallest meaningful fraction while retaining the 1K safety floor."""
+        if self.metadata is None:
+            return 1.0
+        return min(1.0, 1_000 / max(1, self.metadata["lod_levels"]["full"]))
+
     def lod_fraction(self, lod: object) -> float:
-        """把客户端 LOD 请求（名称或比例）解析成 0.05-1.0 的比例上限。"""
+        """把客户端 LOD 请求（名称或比例）解析成 0-1 的比例上限。"""
         if self.metadata is None:
             return 1.0
         levels = self.metadata["lod_levels"]
         if isinstance(lod, (int, float)) and not isinstance(lod, bool):
-            return float(np.clip(float(lod), 0.05, 1.0))
+            return float(np.clip(float(lod), self.minimum_lod_fraction(), 1.0))
         name = str(lod).lower()
         if name in ("preview", "balanced"):
             return levels[name] / levels["full"]
@@ -666,12 +699,37 @@ class RendererState:
         pan_max = self.metadata["radius"] * 8.0
         if pan_norm > pan_max:
             pan = pan * (pan_max / pan_norm)
-        view = self.view_matrix(center, yaw, pitch, distance, pan)
-        focal = 0.5 * height / math.tan(math.radians(fov) * 0.5)
-        intrinsics = np.array(
-            [[focal, 0.0, width * 0.5], [0.0, focal, height * 0.5], [0.0, 0.0, 1.0]],
-            dtype=np.float32,
-        )
+        supplied_view = request.get("view_matrix")
+        if supplied_view is not None:
+            try:
+                view = np.asarray(supplied_view, dtype=np.float32).reshape(4, 4)
+            except (ValueError, TypeError) as exc:
+                raise ValueError("view_matrix 必须包含 16 个数值") from exc
+            if not np.isfinite(view).all():
+                raise ValueError("view_matrix 必须是有限数值")
+            if not np.allclose(view[3], (0.0, 0.0, 0.0, 1.0), atol=1e-4):
+                raise ValueError("view_matrix 最后一行必须为 [0,0,0,1]")
+            if abs(float(np.linalg.det(view[:3, :3]))) < 1e-6:
+                raise ValueError("view_matrix 旋转部分不可逆")
+            camera_mode = "matrix"
+        else:
+            view = self.view_matrix(center, yaw, pitch, distance, pan)
+            camera_mode = "orbit"
+
+        supplied_intrinsics = request.get("intrinsics")
+        if supplied_intrinsics is not None:
+            try:
+                intrinsics = np.asarray(supplied_intrinsics, dtype=np.float32).reshape(3, 3)
+            except (ValueError, TypeError) as exc:
+                raise ValueError("intrinsics 必须包含 9 个数值") from exc
+            if not np.isfinite(intrinsics).all() or intrinsics[0, 0] <= 0 or intrinsics[1, 1] <= 0:
+                raise ValueError("intrinsics 必须包含有效的正焦距")
+        else:
+            focal = 0.5 * height / math.tan(math.radians(fov) * 0.5)
+            intrinsics = np.array(
+                [[focal, 0.0, width * 0.5], [0.0, focal, height * 0.5], [0.0, 0.0, 1.0]],
+                dtype=np.float32,
+            )
 
         gaussian_count, lod_name = self.lod_count(request)
         full_count = self.metadata["lod_levels"]["full"]
@@ -733,6 +791,7 @@ class RendererState:
                         scales=params["scales"],
                         opacities=params["opacities"],
                         colors=params["colors"],
+                        sh_degree=self.metadata.get("sh_degree"),
                         viewmats=torch.from_numpy(view).to(self.device)[None],
                         Ks=torch.from_numpy(intrinsics).to(self.device)[None],
                         width=width,
@@ -769,6 +828,7 @@ class RendererState:
             "jpeg_backend": _JPEG_BACKEND if image_bytes is not None else None,
             "peak_allocated_mib": round(torch.cuda.max_memory_allocated(self.device) / 2**20, 1),
             "peak_reserved_mib": round(torch.cuda.max_memory_reserved(self.device) / 2**20, 1),
+            "camera_mode": camera_mode,
             "yaw": yaw, "pitch": pitch, "distance": distance,
         }
         return (pixels if return_pixels else image_bytes), stats
@@ -781,7 +841,10 @@ class RendererState:
         count = min(max(1, int(count)), model["means"].shape[0])
         means = model["means"][:count].detach().cpu().numpy()
         scales = model["scales"][:count].detach().cpu().numpy()
-        rgb = np.clip(model["colors"][:count].detach().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
+        colors = model["colors"][:count].detach().cpu().numpy()
+        if colors.ndim == 3:
+            colors = np.clip(0.5 + SH_C0 * colors[:, 0, :], 0.0, 1.0)
+        rgb = np.clip(colors * 255.0, 0, 255).astype(np.uint8)
         opacity = np.clip(model["opacities"][:count].detach().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
         dtype = np.dtype([
             ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
@@ -1181,8 +1244,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             if session.auto_frames > 3:
                 rt = stats["render_ms"]
                 if rt > budget * 1.2:
+                    minimum_fraction = self.app.state.minimum_lod_fraction()
                     session.auto_fraction = max(
-                        0.05, session.auto_fraction * budget / max(rt, 1.0))
+                        minimum_fraction, session.auto_fraction * budget / max(rt, 1.0))
                 elif rt < budget * 0.5:
                     session.auto_fraction = min(ceiling, session.auto_fraction * 1.15)
         session.stats = {

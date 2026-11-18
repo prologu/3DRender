@@ -1,0 +1,24 @@
+{
+  "date": "2026-11-18",
+  "device": "NVIDIA RTX A6000",
+  "model": "CityGaussian Mill-19 Building",
+  "model_gaussians": 7982010,
+  "model_sh_degree": 2,
+  "transport": "webrtc",
+  "viewport": "800x450",
+  "interactive_width": 480,
+  "interactive_target_gaussians": 300000,
+  "interactive_gaussian_range": [288814, 310734],
+  "interactive_lod_strategy": "spatial",
+  "interactive_frames": 66,
+  "interactive_stats": 89,
+  "final_frame_latency_ms": 188.3,
+  "browser_errors": [],
+  "unit_tests": {
+    "server.tests.test_camera_math": {
+      "passed": 5,
+      "failed": 0
+    }
+  },
+  "notes": "Spatial LOD preserves complete screen-space cells, so the realized Gaussian count is allowed to remain within 15% of the requested interaction budget. The settled frame uses the full model."
+}

@@ -107,6 +107,18 @@ const median = values => {
   result.expectedGaussians = expectedGaussians;
   result.expectedInteractiveGaussians = Math.min(
     expectedGaussians, quality === 'high' ? 550000 : 300000);
+  result.interactiveLodStrategies = [...new Set(
+    interactiveStats.map(stats => stats.lod_strategy || 'prefix'))];
+  // Prefix LOD is an exact top-N selection. Spatial LOD selects complete
+  // screen-space cells, so the realized count may straddle the requested
+  // budget by a small amount instead of splitting a cell arbitrarily.
+  const spatialTolerance = Math.max(5000, Math.round(result.expectedInteractiveGaussians * 0.15));
+  result.invalidGaussianStats = interactiveStats.filter(stats => {
+    if (stats.lod_strategy === 'spatial') {
+      return Math.abs(stats.gaussians - result.expectedInteractiveGaussians) > spatialTolerance;
+    }
+    return stats.gaussians !== result.expectedInteractiveGaussians;
+  }).length;
   result.lodPercent = lodPercent;
   result.quality = quality;
   result.errors = errors;
@@ -117,7 +129,7 @@ const median = values => {
   if (!['webrtc', 'websocket'].includes(result.transport) || result.interactiveFrames < 1 || result.interactiveStats < 1 ||
       result.finalWidth !== expectedWidth || result.finalFrameLatencyMs == null ||
       result.finalFrameLatencyMs > 5000 || result.interactiveWidths.some(width => width > 640) ||
-      result.interactiveGaussianRange.some(count => count !== result.expectedInteractiveGaussians) ||
+      result.invalidGaussianStats > 0 ||
       errors.length) process.exit(1);
 })().catch(error => {
   console.error(error);

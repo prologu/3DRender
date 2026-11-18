@@ -1,6 +1,10 @@
 # Frontend dependencies and build output
 frontend/node_modules/
 frontend/dist/
+
+# Local benchmark image outputs (large, reproducible, and not source code)
+results/images/
+results/pose_samples/
 frontend/.vite/
 frontend/tests/*.png
 frontend/tests/*.jpg
