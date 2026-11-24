@@ -41,6 +41,11 @@ class SceneHandler(SimpleHTTPRequestHandler):
 
     def end_headers(self) -> None:
         path = urlsplit(self.path).path
+        # Cross-origin isolation unlocks SharedArrayBuffer, which lets the
+        # ordinary-scene renderer share its sort buffers with the worker and
+        # use GPU-assisted distance computation without copying every frame.
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Cross-Origin-Embedder-Policy", "credentialless")
         if path.startswith("/assets/"):
             self.send_header("Cache-Control", "public, max-age=31536000, immutable")
             self.send_header("Vary", "Accept-Encoding")

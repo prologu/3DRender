@@ -64,8 +64,10 @@ with tempfile.TemporaryDirectory() as temporary:
         assert status == 200 and headers["Content-Encoding"] == "gzip", (status, headers)
         assert gzip.decompress(payload) == script
         assert "immutable" in headers["Cache-Control"]
-        status, _, payload = request(connection, "GET", "/api/health")
+        status, headers, payload = request(connection, "GET", "/api/health")
         assert status == 200 and json.loads(payload)["uploads"] is True
+        assert headers["Cross-Origin-Opener-Policy"] == "same-origin"
+        assert headers["Cross-Origin-Embedder-Policy"] == "credentialless"
         print(json.dumps({"ok": True, "range": "2-5/10", "gzip": True, "scene": scene["id"]}))
     finally:
         connection.close()
