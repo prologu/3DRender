@@ -42,10 +42,10 @@ const jobs = {
   },
   paged: {
     mode: 'paged',
-    name: '03-paged-building-7p98m-rad-radc-slow',
-    source: 'CityGaussian Mill-19 Building converted from 7.98M Gaussian PLY',
+    name: '03-paged-building-2m-rad-radc-slow',
+    source: '2.0M importance subset exported from CityGaussian Mill-19 Building 7.98M Gaussian PLY',
     format: 'RAD + RADC',
-    gaussians: 7982010,
+    gaussians: 2000000,
     camera: BUILDING_CAMERA,
   },
 };
@@ -179,19 +179,27 @@ async function startSlowCameraMotion(page, viewerGlobal) {
   }, viewerGlobal);
 }
 
-async function applyTrainingCamera(page, viewerGlobal, cameraSpec) {
-  await page.evaluate(({ viewerGlobal, cameraSpec }) => {
+async function applyTrainingCamera(page, viewerGlobal, cameraSpec, flipYZ = false) {
+  await page.evaluate(({ viewerGlobal, cameraSpec, flipYZ }) => {
     const viewer = window[viewerGlobal];
     const camera = viewer.camera;
     const controls = viewer.controls;
-    const [px, py, pz] = cameraSpec.position;
+    let [px, py, pz] = cameraSpec.position;
     const rotation = cameraSpec.rotation;
-    const forward = {
+    let forward = {
       x: rotation[0][2], y: rotation[1][2], z: rotation[2][2],
     };
-    const up = {
+    let up = {
       x: -rotation[0][1], y: -rotation[1][1], z: -rotation[2][1],
     };
+    // PagedSceneViewer applies a 180-degree rotation around X to standard
+    // 3DGS data. Transform the camera by the same diag(1,-1,-1) matrix.
+    if (flipYZ) {
+      py = -py;
+      pz = -pz;
+      forward = { x: forward.x, y: -forward.y, z: -forward.z };
+      up = { x: up.x, y: -up.y, z: -up.z };
+    }
     const distance = 300;
     camera.position.set(px, py, pz);
     camera.up.set(up.x, up.y, up.z).normalize();
@@ -205,7 +213,7 @@ async function applyTrainingCamera(page, viewerGlobal, cameraSpec) {
     camera.lookAt(controls.target);
     controls.update();
     viewer.requestRender?.(5);
-  }, { viewerGlobal, cameraSpec });
+  }, { viewerGlobal, cameraSpec, flipYZ });
   await page.waitForTimeout(1200);
 }
 
@@ -276,9 +284,16 @@ async function runJob(browser, key, job) {
     // One decoded page is sufficient to start. A page may legitimately contain
     // fewer than 100k splats, so a fixed 100k gate can reject a healthy scene.
     await page.waitForFunction(() => window.__lumaPagedViewer?.spark?.activeSplats > 0, null, { timeout: 180000 });
-    await page.waitForFunction(() => Boolean(window.__lumaPagedViewer?.home), null, { timeout: 60000 });
-    await page.evaluate(() => window.__lumaPagedViewer.reset());
-    await page.waitForTimeout(5000);
+    await applyTrainingCamera(page, '__lumaPagedViewer', job.camera, true);
+    await page.evaluate(() => {
+      const viewer = window.__lumaPagedViewer;
+      // Request a denser settled LOD for recorded quality. The interactive UI
+      // can still lower this scale temporarily while the user is dragging.
+      viewer.spark.lodSplatScale = 0.25;
+      viewer.spark.lodRenderScale = 0.75;
+      viewer.requestRender(60);
+    });
+    await page.waitForTimeout(10000);
     viewerGlobal = '__lumaPagedViewer';
   }
 
@@ -286,16 +301,7 @@ async function runJob(browser, key, job) {
   if (job.mode === 'local') {
     await applyTrainingCamera(page, viewerGlobal, job.camera);
   } else {
-    await page.evaluate(() => {
-      const viewer = window.__lumaPagedViewer;
-      viewer.reset();
-      // The first resident page can yield an overly conservative bounding
-      // sphere. Move 72% toward the scene center for a human-scale overview.
-      viewer.camera.position.lerp(viewer.controls.target, 0.72);
-      viewer.camera.lookAt(viewer.controls.target);
-      viewer.controls.update();
-      viewer.requestRender(30);
-    });
+    await applyTrainingCamera(page, viewerGlobal, job.camera, true);
     await page.waitForTimeout(5000);
   }
   await page.addStyleTag({ content: `

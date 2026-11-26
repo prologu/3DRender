@@ -846,18 +846,25 @@ class RendererState:
             colors = np.clip(0.5 + SH_C0 * colors[:, 0, :], 0.0, 1.0)
         rgb = np.clip(colors * 255.0, 0, 255).astype(np.uint8)
         opacity = np.clip(model["opacities"][:count].detach().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
+        quats = model["quats"][:count].detach().cpu().numpy()
+        quats /= np.maximum(np.linalg.norm(quats, axis=1, keepdims=True), 1e-8)
+        # The common 32-byte SPLAT layout stores quaternion [w, x, y, z]
+        # as unsigned bytes with 128 as zero and a scale of 128. Keeping the
+        # learned rotation is essential for anisotropic Gaussians; replacing
+        # it with a constant identity quaternion produces severe radial streaks.
+        rotations = np.clip(np.rint(quats * 128.0 + 128.0), 0, 255).astype(np.uint8)
         dtype = np.dtype([
             ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
             ("sx", "<f4"), ("sy", "<f4"), ("sz", "<f4"),
             ("r", "u1"), ("g", "u1"), ("b", "u1"), ("o", "u1"),
-            ("pad", "u1", (4,)),
+            ("rotation", "u1", (4,)),
         ])
         buffer = np.empty(count, dtype=dtype)
         buffer["x"], buffer["y"], buffer["z"] = means[:, 0], means[:, 1], means[:, 2]
         buffer["sx"], buffer["sy"], buffer["sz"] = scales[:, 0], scales[:, 1], scales[:, 2]
         buffer["r"], buffer["g"], buffer["b"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
         buffer["o"] = opacity
-        buffer["pad"][:] = (255, 128, 128, 128)
+        buffer["rotation"][:] = rotations
         return buffer.tobytes()
 
 
