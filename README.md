@@ -419,6 +419,14 @@ python3 server/fix_standard_3dgs_ply.py input.ply input_fixed.ply
 
 脚本执行 `scale_* = log(scale)`、`opacity = logit(opacity)`，并拒绝覆盖输入文件。仅当确认文件保存的是线性值时使用；不要对正常标准 PLY 重复转换。
 
+### 普通场景自适应渲染
+
+“自适应（推荐）”质量档将大场景的按需更新思想用于普通本地模型：静止视角不重复提交相同帧；拖动、平移或缩放期间使用 1x 像素比并暂时关闭高阶球谐着色，停止 220 ms 后恢复最高 1.5x 与二阶球谐。明确选择“性能”档时才使用半精度协方差纹理，以免增加默认档的首次加载时间。界面 FPS 统计底层实际绘制次数，静止按需渲染时会正确显示 0，而不是浏览器 RAF 频率。
+
+部署服务器提供跨源隔离，以便继续测试共享排序缓冲，但该路径在 GTX 1650 Ti 的 400K/1M 消融中分别只有旧路径的 0.94x/0.96x 吞吐，因此默认关闭。可在页面加载前设置 `window.LUMA_ENABLE_SHARED_SORT = true` 单独测试。`gaussian-splats-3d 0.4.7` 的 GPU 距离预计算还会在部分 WebGL 驱动上产生空帧，仅当共享排序已启用并设置 `window.LUMA_ENABLE_GPU_SORT = true` 时才会实验性开启。
+
+普通模型不会在打开时临时构建 Spark LoD：实测表明，未预处理 PLY 的在线 LoD 构建可能比直接加载慢一个数量级。超过 `window.LUMA_DIRECT_SPLAT_LIMIT` 的模型仍会进入显式浏览器 LoD 路径；追求稳定流式性能时应预先转换为 RAD/RADC，并使用大场景模式。
+
 ## 6. 验证与测试
 
 前端构建：
@@ -440,10 +448,12 @@ npm run test:server
 npm run test:stream    # 快速拖动、背压、松手最终帧延迟
 npm run test:mjpeg     # 禁用 WebSocket 后验证自动降级与会话释放
 npm run test:local-lod # 本地 PLY -> 浏览器 LoD + 自动分流，不上传服务器
+npm run test:adaptive-local # 普通场景按需绘制、交互降载和静止质量恢复
 
 # 生成 100K/500K/1M 基准并测试当前浏览器 GPU
 npm run benchmark:generate
 npm run benchmark:local
+npm run benchmark:adaptive-local # 旧持续绘制 / 按需绘制 / 自适应的同场景消融
 
 # 在 GPU 服务器本机测试 API（排除网络传输）
 python3 ../server/benchmark_api.py tests/generated/benchmark-1000000.ply

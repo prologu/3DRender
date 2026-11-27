@@ -58,14 +58,27 @@ with tempfile.TemporaryDirectory() as temporary:
         )
         assert status == 206 and payload == b"2345", (status, payload)
         assert headers["Accept-Ranges"] == "bytes"
+        assert headers["Access-Control-Allow-Origin"] == "*"
+        assert "Content-Range" in headers["Access-Control-Expose-Headers"]
+        status, headers, payload = request(
+            connection, "OPTIONS", f"/scenes/{scene['id']}/city.rad", headers={
+                "Origin": "http://127.0.0.1:8088",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "Range",
+            }
+        )
+        assert status == 204 and not payload, (status, payload)
+        assert "Range" in headers["Access-Control-Allow-Headers"]
         status, headers, payload = request(
             connection, "GET", "/assets/index-hash.js", headers={"Accept-Encoding": "gzip"}
         )
         assert status == 200 and headers["Content-Encoding"] == "gzip", (status, headers)
         assert gzip.decompress(payload) == script
         assert "immutable" in headers["Cache-Control"]
-        status, _, payload = request(connection, "GET", "/api/health")
+        status, headers, payload = request(connection, "GET", "/api/health")
         assert status == 200 and json.loads(payload)["uploads"] is True
+        assert headers["Cross-Origin-Opener-Policy"] == "same-origin"
+        assert headers["Cross-Origin-Embedder-Policy"] == "credentialless"
         print(json.dumps({"ok": True, "range": "2-5/10", "gzip": True, "scene": scene["id"]}))
     finally:
         connection.close()

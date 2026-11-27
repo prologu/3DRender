@@ -36,8 +36,9 @@ let pagedViewer = null;
 let objectUrl = null;
 let activeFile = null;
 let toastTimer = null;
-let frameCount = 0;
+let clientRenderedFrames = 0;
 let fpsStartedAt = performance.now();
+let clientQualityRestoreTimer = null;
 let dragDepth = 0;
 let renderLocation = 'client';
 let serverFrameUrl = null;
@@ -974,26 +975,55 @@ function setProgress(percent) {
   els.loadingDetail.textContent = value < 100 ? '正在载入并解析高斯数据…' : '正在构建渲染缓冲区…';
 }
 
-function createViewer() {
-  return new GaussianSplats3D.Viewer({
+function createViewer(metadata = null) {
+  clientRenderedFrames = 0;
+  const sharedSort = window.LUMA_ENABLE_SHARED_SORT === true &&
+    window.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined';
+  const gpuSort = sharedSort && window.LUMA_ENABLE_GPU_SORT === true;
+  const onDemandRendering = window.LUMA_DISABLE_ADAPTIVE_ON_DEMAND !== true;
+  const pointCount = Number(metadata?.gaussians || 0);
+  const compactGpuData = els.qualitySelect.value === 'performance';
+  window.__lumaRendererProfile = {
+    sharedSort,
+    gpuAcceleratedSort: gpuSort,
+    integerBasedSort: !pointCount || pointCount <= 1_000_000,
+    halfPrecisionCovariancesOnGPU: compactGpuData,
+    renderMode: onDemandRendering ? 'on-change' : 'always'
+  };
+  const clientViewer = new GaussianSplats3D.Viewer({
     rootElement: els.viewport,
     cameraUp: [0, 1, 0],
     initialCameraPosition: [0, 0, 6],
     initialCameraLookAt: [0, 0, 0],
     selfDrivenMode: true,
     useBuiltInControls: true,
-    sharedMemoryForWorkers: false,
-    gpuAcceleratedSort: false,
+    sharedMemoryForWorkers: sharedSort,
+    gpuAcceleratedSort: gpuSort,
     enableSIMDInSort: true,
-    halfPrecisionCovariancesOnGPU: false,
+    integerBasedSort: !pointCount || pointCount <= 1_000_000,
+    halfPrecisionCovariancesOnGPU: compactGpuData,
+    dynamicScene: false,
+    optimizeSplatData: true,
+    inMemoryCompressionLevel: 0,
+    freeIntermediateSplatData: true,
     sphericalHarmonicsDegree: 2,
     sceneRevealMode: GaussianSplats3D.SceneRevealMode.Instant,
-    renderMode: GaussianSplats3D.RenderMode.Always,
+    renderMode: onDemandRendering ? GaussianSplats3D.RenderMode.OnChange : GaussianSplats3D.RenderMode.Always,
     antialiased: false
   });
+  const render = clientViewer.renderer.render;
+  clientViewer.renderer.render = function countedRender(...args) {
+    const result = render.apply(this, args);
+    clientRenderedFrames++;
+    return result;
+  };
+  return clientViewer;
 }
 
 async function disposeViewer() {
+  if (clientQualityRestoreTimer) clearTimeout(clientQualityRestoreTimer);
+  clientQualityRestoreTimer = null;
+  clientRenderedFrames = 0;
   if (viewer) {
     try { viewer.stop(); } catch (_) { /* already stopped */ }
     try { await viewer.dispose(); } catch (_) { /* best-effort cleanup */ }
@@ -1187,16 +1217,47 @@ function localDirectThreshold() {
   return 3_000_000;
 }
 
+function clientPixelRatio(interactive = false) {
+  const quality = els.qualitySelect.value;
+  if (quality === 'performance') return 1;
+  if (quality === 'adaptive' && interactive) return 1;
+  return quality === 'adaptive'
+    ? Math.min(window.devicePixelRatio || 1, 1.5)
+    : window.devicePixelRatio;
+}
+
+function applyClientQuality(interactive = false) {
+  if (!viewer || renderLocation !== 'client') return;
+  viewer.renderer.setPixelRatio(clientPixelRatio(interactive));
+  viewer.setActiveSphericalHarmonicsDegrees?.(
+    els.qualitySelect.value === 'adaptive' && interactive ? 0 : 2
+  );
+  viewer.updateForRendererSizeChanges();
+  window.__lumaClientQualityPhase = interactive ? 'interactive' : 'settled';
+}
+
+function markClientInteraction() {
+  if (!viewer || renderLocation !== 'client' || els.qualitySelect.value !== 'adaptive') return;
+  if (clientQualityRestoreTimer) clearTimeout(clientQualityRestoreTimer);
+  applyClientQuality(true);
+  clientQualityRestoreTimer = setTimeout(() => {
+    clientQualityRestoreTimer = null;
+    applyClientQuality(false);
+  }, 220);
+}
+
 function createPagedSceneViewer(sourceLabel, localMeta = null) {
   return new PagedSceneViewerClass({
     root: els.viewport,
     background: els.backgroundSelect.value,
     quality: els.qualitySelect.value,
     onProgress: setProgress,
-    onStats: ({ fps, activeSplats, maxPagedSplats }) => {
+    onStats: ({ fps, activeSplats, maxPagedSplats, qualityPhase, pixelRatio }) => {
       if (renderLocation !== 'paged') return;
       els.fpsValue.textContent = fps || '—';
-      els.splatCount.textContent = `${formatCount(activeSplats)} / ${formatCount(maxPagedSplats)}`;
+      const totalSplats = localMeta?.gaussians || maxPagedSplats;
+      els.splatCount.textContent = `${formatCount(activeSplats)} / ${formatCount(totalSplats)}`;
+      window.__lumaLocalLodStats = { fps, activeSplats, maxPagedSplats, qualityPhase, pixelRatio };
     },
     onReady: ({ name, maxPagedSplats, activeSplats, localLod }) => {
       activeFile = { name, extension: localLod ? localMeta?.extension : 'rad', paged: !localLod, localLod, url: sourceLabel };
@@ -1257,7 +1318,7 @@ async function loadScene(source, metadata, extension, skipDispose = false) {
       spz: GaussianSplats3D.SceneFormat.Spz
     }[extension];
     if (!skipDispose) await disposeViewer();
-    viewer = createViewer();
+    viewer = createViewer(metadata);
     activeFile = metadata;
     await viewer.addSplatScene(source, {
       format,
@@ -1268,7 +1329,9 @@ async function loadScene(source, metadata, extension, skipDispose = false) {
     });
     viewer.start();
     window.__lumaViewer = viewer;
+    window.__lumaClientQualityPhase = 'settled';
     viewer.renderer.setClearColor(els.backgroundSelect.value, 1);
+    applyClientQuality(false);
     els.viewport.classList.add('ready');
     els.welcome.classList.add('hidden');
     els.modelPanel.classList.add('visible');
@@ -1318,7 +1381,7 @@ async function handleFile(file) {
   }
   await disposeViewer();
   objectUrl = URL.createObjectURL(file);
-  await loadScene(objectUrl, { name: file.name, size: file.size, extension }, extension, true);
+  await loadScene(objectUrl, { ...inspected, name: file.name, size: file.size, extension }, extension, true);
 }
 
 async function loadDemo() {
@@ -1403,11 +1466,10 @@ function setPanel(open) {
 }
 
 function tickFps(now) {
-  frameCount++;
   if (now - fpsStartedAt >= 700) {
-    if (renderLocation === 'client') els.fpsValue.textContent = viewer ? Math.round(frameCount * 1000 / (now - fpsStartedAt)) : '—';
+    if (renderLocation === 'client') els.fpsValue.textContent = viewer ? Math.round(clientRenderedFrames * 1000 / (now - fpsStartedAt)) : '—';
     if (viewer?.splatMesh) els.splatCount.textContent = formatCount(viewer.splatMesh.getSplatCount());
-    frameCount = 0;
+    clientRenderedFrames = 0;
     fpsStartedAt = now;
   }
   requestAnimationFrame(tickFps);
@@ -1449,15 +1511,17 @@ els.qualitySelect.addEventListener('change', () => {
   }
   if (renderLocation === 'paged') {
     pagedViewer?.setQuality(els.qualitySelect.value);
-    showToast(els.qualitySelect.value === 'performance' ? '流式性能模式' : '流式高清模式');
+    showToast(els.qualitySelect.value === 'adaptive' ? '自适应 LoD：移动降载，静止恢复' : els.qualitySelect.value === 'performance' ? '流式性能模式' : '流式高清模式');
     return;
   }
   if (!viewer) return;
-  const performanceMode = els.qualitySelect.value === 'performance';
-  viewer.renderer.setPixelRatio(performanceMode ? 1 : window.devicePixelRatio);
-  viewer.updateForRendererSizeChanges();
-  showToast(performanceMode ? '已切换至性能模式' : '已切换至高清模式');
+  applyClientQuality(false);
+  showToast(els.qualitySelect.value === 'adaptive' ? '自适应分辨率：移动降载，静止恢复' : els.qualitySelect.value === 'performance' ? '已切换至性能模式' : '已切换至高清模式');
 });
+
+els.viewport.addEventListener('pointerdown', markClientInteraction);
+els.viewport.addEventListener('pointermove', (event) => { if (event.buttons) markClientInteraction(); });
+els.viewport.addEventListener('wheel', markClientInteraction, { passive: true });
 
 window.addEventListener('keydown', (event) => {
   if (/^(input|select|textarea)$/i.test(event.target.tagName || '')) return;

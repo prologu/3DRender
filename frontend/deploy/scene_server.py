@@ -41,12 +41,29 @@ class SceneHandler(SimpleHTTPRequestHandler):
 
     def end_headers(self) -> None:
         path = urlsplit(self.path).path
+        # RAD/RADC assets are commonly hosted on a GPU/data server while the
+        # viewer is served locally or from a CDN.  Spark uses Range requests,
+        # so both the request header and range metadata must be CORS-visible.
+        self.send_header("Access-Control-Allow-Origin", os.environ.get("CORS_ALLOW_ORIGIN", "*"))
+        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS, POST, PUT, DELETE")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Range")
+        self.send_header("Access-Control-Expose-Headers", "Accept-Ranges, Content-Length, Content-Range")
+        # Cross-origin isolation unlocks SharedArrayBuffer, which lets the
+        # ordinary-scene renderer share its sort buffers with the worker and
+        # use GPU-assisted distance computation without copying every frame.
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Cross-Origin-Embedder-Policy", "credentialless")
         if path.startswith("/assets/"):
             self.send_header("Cache-Control", "public, max-age=31536000, immutable")
             self.send_header("Vary", "Accept-Encoding")
         elif path == "/" or path.endswith("/index.html"):
             self.send_header("Cache-Control", "no-cache")
         super().end_headers()
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def send_head(self):
         """Prefer build-time gzip for hashed assets; retain normal Range behavior."""

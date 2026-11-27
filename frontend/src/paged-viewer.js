@@ -20,7 +20,11 @@ export class PagedSceneViewer {
   constructor({ root, background, quality = 'high', onProgress, onReady, onStats }) {
     this.root = root;
     this.background = background;
+    this.quality = quality;
     this.performanceMode = quality === 'performance';
+    this.adaptiveMode = quality === 'adaptive';
+    this.interacting = false;
+    this.restoreQualityAt = 0;
     this.onProgress = onProgress;
     this.onReady = onReady;
     this.onStats = onStats;
@@ -44,8 +48,8 @@ export class PagedSceneViewer {
     this.controls.dampingFactor = 0.08;
     this.controls.screenSpacePanning = true;
     this.controls.addEventListener('change', () => this.requestRender(4));
-    this.controls.addEventListener('start', () => this.requestRender(30));
-    this.controls.addEventListener('end', () => this.requestRender(12));
+    this.controls.addEventListener('start', () => this.beginInteraction());
+    this.controls.addEventListener('end', () => this.endInteraction());
 
     this.spark = new SparkRenderer({
       renderer: this.renderer,
@@ -58,6 +62,7 @@ export class PagedSceneViewer {
       minSortIntervalMs: this.performanceMode ? 20 : 0
     });
     this.scene.add(this.spark);
+    this.applyQualityProfile();
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(this.root);
     this.resize();
@@ -126,10 +131,70 @@ export class PagedSceneViewer {
     this.settleFrames = Math.max(this.settleFrames, frames);
   }
 
+  qualityProfile() {
+    if (this.performanceMode) {
+      return { lodSplatScale: 0.55, lodRenderScale: 1.7, pixelRatio: 1, minSortIntervalMs: 20 };
+    }
+    if (this.adaptiveMode && this.interacting) {
+      return { lodSplatScale: 0.38, lodRenderScale: 2.2, pixelRatio: 1, minSortIntervalMs: 24 };
+    }
+    return {
+      // A settled desktop view should be limited by the RAD hierarchy and the
+      // screen-space error, not by Spark's generic 2.5M desktop target.  A
+      // sub-pixel render threshold is important for close architectural views.
+      lodSplatScale: 2,
+      lodRenderScale: 0.35,
+      pixelRatio: Math.min(window.devicePixelRatio || 1, 1.5),
+      minSortIntervalMs: 0
+    };
+  }
+
+  pagingSnapshot() {
+    const pager = this.spark.pager;
+    if (!pager) return { busy: false, pendingPages: 0, residentPages: 0 };
+    const pendingPages = (pager.fetchers?.length || 0) +
+      (pager.fetched?.length || 0) +
+      (pager.newUploads?.length || 0) +
+      (pager.readyUploads?.length || 0) +
+      (pager.lodTreeUpdates?.length || 0) +
+      (pager.fetchPriority?.length || 0);
+    return {
+      busy: pendingPages > 0,
+      pendingPages,
+      residentPages: pager.pageToSplatsChunk?.reduce((count, entry) => count + (entry ? 1 : 0), 0) || 0
+    };
+  }
+
+  applyQualityProfile() {
+    const profile = this.qualityProfile();
+    this.spark.lodSplatScale = profile.lodSplatScale;
+    this.spark.lodRenderScale = profile.lodRenderScale;
+    this.spark.minSortIntervalMs = profile.minSortIntervalMs;
+    if (this.renderer.getPixelRatio() !== profile.pixelRatio) {
+      this.renderer.setPixelRatio(profile.pixelRatio);
+      this.renderer.setSize(Math.max(1, this.root.clientWidth), Math.max(1, this.root.clientHeight), false);
+    }
+    this.requestRender(4);
+  }
+
+  beginInteraction() {
+    this.restoreQualityAt = 0;
+    if (this.adaptiveMode && !this.interacting) {
+      this.interacting = true;
+      this.applyQualityProfile();
+    }
+    this.requestRender(30);
+  }
+
+  endInteraction() {
+    if (this.adaptiveMode) this.restoreQualityAt = performance.now() + 220;
+    this.requestRender(18);
+  }
+
   resize() {
     const width = Math.max(1, this.root.clientWidth);
     const height = Math.max(1, this.root.clientHeight);
-    const pixelRatio = this.performanceMode ? 1 : Math.min(window.devicePixelRatio || 1, 1.5);
+    const pixelRatio = this.qualityProfile().pixelRatio;
     this.renderer.setPixelRatio(pixelRatio);
     this.renderer.setSize(width, height, false);
     this.camera.aspect = width / height;
@@ -139,6 +204,11 @@ export class PagedSceneViewer {
 
   loop(now) {
     if (!this.running) return;
+    if (this.restoreQualityAt && now >= this.restoreQualityAt) {
+      this.restoreQualityAt = 0;
+      this.interacting = false;
+      this.applyQualityProfile();
+    }
     // A paged RAD resolves before its first coarse chunk is resident, so its
     // bounding box is initially empty. Fit once when that first useful chunk
     // arrives; do not keep chasing the growing resident-cache bounds.
@@ -148,12 +218,8 @@ export class PagedSceneViewer {
     }
     const controlsChanged = this.controls.update();
     if (controlsChanged) this.requestRender(3);
-    const pager = this.spark.pager;
-    const pagerBusy = pager && (
-      pager.fetchers?.length || pager.fetched?.length || pager.newUploads?.length ||
-      pager.readyUploads?.length || pager.lodTreeUpdates?.length || pager.fetchPriority?.length
-    );
-    if (pagerBusy) this.requestRender(2);
+    const paging = this.pagingSnapshot();
+    if (paging.busy) this.requestRender(2);
     if (this.dirty || this.settleFrames > 0) {
       this.renderer.render(this.scene, this.camera);
       this.renderedFrames++;
@@ -168,7 +234,13 @@ export class PagedSceneViewer {
           ? Math.round(this.renderedFrames * 1000 / (now - this.statsStartedAt))
           : null,
         activeSplats: this.spark.activeSplats,
-        maxPagedSplats: this.spark.maxPagedSplats
+        maxPagedSplats: this.spark.maxPagedSplats,
+        qualityPhase: this.adaptiveMode ? (this.interacting ? 'interactive' : 'settled') : this.quality,
+        pixelRatio: this.renderer.getPixelRatio(),
+        pendingPages: paging.pendingPages,
+        residentPages: paging.residentPages,
+        lodSplatScale: this.spark.lodSplatScale,
+        lodRenderScale: this.spark.lodRenderScale
       });
       this.renderedFrames = 0;
       this.statsStartedAt = now;
@@ -193,10 +265,12 @@ export class PagedSceneViewer {
   }
 
   setQuality(quality) {
+    this.quality = quality;
     this.performanceMode = quality === 'performance';
-    this.spark.lodSplatScale = this.performanceMode ? 0.55 : 1;
-    this.spark.lodRenderScale = this.performanceMode ? 1.7 : 1;
-    this.spark.minSortIntervalMs = this.performanceMode ? 20 : 0;
+    this.adaptiveMode = quality === 'adaptive';
+    this.interacting = false;
+    this.restoreQualityAt = 0;
+    this.applyQualityProfile();
     this.resize();
   }
 

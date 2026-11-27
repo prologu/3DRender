@@ -1,15 +1,22 @@
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
+const { execFile } = require('node:child_process');
+const { promisify } = require('node:util');
 const { chromium } = require('playwright-core');
 
+const execFileAsync = promisify(execFile);
+
 const ROOT = path.resolve(__dirname, '..');
-const OUT = path.join(ROOT, 'results', 'slow-media-v3');
+const OUT = process.env.CAPTURE_OUT || path.join(ROOT, 'results', 'slow-media-v3');
 const CHROME = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
 const LOCAL_URL = process.env.LOCAL_VIEWER_URL || 'http://127.0.0.1:8088/';
 const PAGED_URL = process.env.PAGED_VIEWER_URL || 'http://127.0.0.1:8089/';
 const RAD_SCENE_URL = process.env.RAD_SCENE_URL
-  || 'http://127.0.0.1:8089/scenes/83781dbf575810710dec15ae626844c6/building-lod.rad';
+  || 'http://127.0.0.1:8089/scenes/b2c0ffee575810710dec15ae626844d8/building_sh2-lod.rad';
+const FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
+const FFPROBE_PATH = process.env.FFPROBE_PATH
+  || path.join(path.dirname(FFMPEG_PATH), process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe');
 const BUILDING_CAMERA = {
   position: [-123.97197986133273, -0.8833597651657765, 304.001000303404],
   rotation: [
@@ -42,10 +49,10 @@ const jobs = {
   },
   paged: {
     mode: 'paged',
-    name: '03-paged-building-2m-rad-radc-slow',
-    source: '2.0M importance subset exported from CityGaussian Mill-19 Building 7.98M Gaussian PLY',
+    name: '03-paged-building-7.98m-sh2-rad-radc-slow',
+    source: 'CityGaussian Mill-19 Building 7.98M Gaussian PLY, direct quality RAD build with degree-2 SH',
     format: 'RAD + RADC',
-    gaussians: 2000000,
+    gaussians: 7982010,
     camera: BUILDING_CAMERA,
   },
 };
@@ -54,22 +61,26 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function startMp4Recorder(page, selector, filename) {
   await page.waitForSelector(selector, { timeout: 60000 });
-  await page.evaluate(({ selector, filename }) => {
+  return await page.evaluate(({ selector, filename }) => {
     const source = document.querySelector(selector);
     if (!(source instanceof HTMLCanvasElement)) throw new Error(`Expected canvas: ${selector}`);
     const mimeCandidates = [
       'video/mp4;codecs=avc1.42E01E',
       'video/mp4;codecs=avc1',
       'video/mp4',
+      'video/webm;codecs=vp9',
+      'video/webm;codecs=vp8',
+      'video/webm',
     ];
     const mimeType = mimeCandidates.find(value => MediaRecorder.isTypeSupported(value));
-    if (!mimeType) throw new Error('This Chrome build cannot record MP4/H.264');
+    if (!mimeType) throw new Error('This Chrome build cannot record the WebGL canvas');
     const stream = source.captureStream(24);
     const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 6_000_000 });
     const chunks = [];
     recorder.ondataavailable = event => { if (event.data.size) chunks.push(event.data); };
     recorder.start(1000);
     window.__slowCapture = { recorder, chunks, filename, mimeType, stream };
+    return { mimeType };
   }, { selector, filename });
 }
 
@@ -96,6 +107,32 @@ async function stopMp4Recorder(page, outputPath) {
   await download.saveAs(outputPath);
 }
 
+async function normalizeMp4Duration(inputPath, outputPath, desiredSeconds = 35, fps = 24) {
+  const { stdout } = await execFileAsync(FFPROBE_PATH, [
+    '-v', 'error',
+    '-show_entries', 'format=duration',
+    '-of', 'default=noprint_wrappers=1:nokey=1',
+    inputPath,
+  ]);
+  const sourceSeconds = Number(stdout.trim());
+  if (!Number.isFinite(sourceSeconds) || sourceSeconds <= 0) {
+    throw new Error(`Unable to read recorded MP4 duration: ${stdout}`);
+  }
+  const frameCount = Math.round(desiredSeconds * fps);
+  const timestampScale = desiredSeconds / sourceSeconds;
+  await execFileAsync(FFMPEG_PATH, [
+    '-hide_banner', '-loglevel', 'warning',
+    '-i', inputPath,
+    '-vf', `setpts=PTS*${timestampScale},fps=${fps},tpad=stop_mode=clone:stop_duration=0.10`,
+    '-frames:v', String(frameCount),
+    '-an',
+    '-c:v', 'libx264', '-preset', 'medium', '-crf', '17',
+    '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+    '-y', outputPath,
+  ], { maxBuffer: 16 * 1024 * 1024 });
+  return { sourceSeconds, desiredSeconds, fps, frameCount, timestampScale };
+}
+
 async function startSlowCameraMotion(page, viewerGlobal) {
   await page.evaluate(viewerGlobal => {
     const viewer = window[viewerGlobal];
@@ -112,14 +149,17 @@ async function startSlowCameraMotion(page, viewerGlobal) {
     const keyframes = [
       { t: 0.0, panX: 0.00, panY: 0.00, yaw: 0.00, pitch: 0.00, zoom: 1.00 },
       { t: 2.5, panX: 0.00, panY: 0.00, yaw: 0.00, pitch: 0.00, zoom: 1.00 },
-      { t: 6.5, panX: -0.055, panY: 0.00, yaw: -0.055, pitch: 0.00, zoom: 1.00 },
-      { t: 10.5, panX: 0.055, panY: 0.00, yaw: 0.055, pitch: 0.00, zoom: 1.00 },
+      // Keep translations deliberately small: this training camera is already
+      // close to the mill roof, so a wide truck/dolly path can enter the
+      // reconstructed surface and create an invalid, blurred view.
+      { t: 6.5, panX: -0.015, panY: 0.00, yaw: -0.040, pitch: 0.00, zoom: 1.00 },
+      { t: 10.5, panX: 0.015, panY: 0.00, yaw: 0.040, pitch: 0.00, zoom: 1.00 },
       { t: 13.5, panX: 0.00, panY: 0.00, yaw: 0.00, pitch: 0.00, zoom: 1.00 },
-      { t: 17.5, panX: 0.00, panY: 0.045, yaw: 0.00, pitch: -0.04, zoom: 1.00 },
-      { t: 21.5, panX: 0.00, panY: -0.045, yaw: 0.00, pitch: 0.04, zoom: 1.00 },
+      { t: 17.5, panX: 0.00, panY: 0.015, yaw: 0.00, pitch: -0.025, zoom: 1.00 },
+      { t: 21.5, panX: 0.00, panY: -0.015, yaw: 0.00, pitch: 0.025, zoom: 1.00 },
       { t: 24.5, panX: 0.00, panY: 0.00, yaw: 0.00, pitch: 0.00, zoom: 1.00 },
-      { t: 28.5, panX: 0.00, panY: 0.00, yaw: 0.00, pitch: 0.00, zoom: 0.86 },
-      { t: 32.5, panX: 0.00, panY: 0.00, yaw: 0.00, pitch: 0.00, zoom: 1.10 },
+      { t: 28.5, panX: 0.00, panY: 0.00, yaw: 0.00, pitch: 0.00, zoom: 0.97 },
+      { t: 32.5, panX: 0.00, panY: 0.00, yaw: 0.00, pitch: 0.00, zoom: 1.06 },
       { t: 35.0, panX: 0.00, panY: 0.00, yaw: 0.00, pitch: 0.00, zoom: 1.00 },
     ];
     const ease = value => value * value * (3 - 2 * value);
@@ -225,15 +265,44 @@ async function saveCanvasPng(page, selector, outputPath) {
   await fsp.writeFile(outputPath, Buffer.from(dataUrl.split(',')[1], 'base64'));
 }
 
+async function waitForPagedQuality(page, { minResidentPages = 20, timeoutMs = 180_000 } = {}) {
+  const started = Date.now();
+  let previousActive = -1;
+  let stableSamples = 0;
+  let state = null;
+  while (Date.now() - started < timeoutMs) {
+    await page.waitForTimeout(500);
+    state = await page.evaluate(() => {
+      const viewer = window.__lumaPagedViewer;
+      return {
+        activeSplats: viewer?.spark?.activeSplats || 0,
+        ...viewer?.pagingSnapshot?.(),
+      };
+    });
+    const tolerance = Math.max(64, Math.round(state.activeSplats * 0.001));
+    stableSamples = Math.abs(state.activeSplats - previousActive) <= tolerance
+      ? stableSamples + 1
+      : 0;
+    previousActive = state.activeSplats;
+    if (stableSamples % 4 === 0) console.log(`[paged-settle] ${JSON.stringify(state)}`);
+    if (state.activeSplats > 0 && state.residentPages >= minResidentPages && stableSamples >= 10) {
+      return { ...state, timedOut: false, elapsedMs: Date.now() - started };
+    }
+  }
+  return { ...state, timedOut: true, elapsedMs: Date.now() - started };
+}
+
 async function captureKeyframes(page, selector, imageDir, prefix) {
   const times = [2500, 6500, 10500, 17500, 28500, 34500];
   let previous = 0;
   for (let index = 0; index < times.length; index++) {
     await sleep(times[index] - previous);
     previous = times[index];
-    await page.screenshot({
-      path: path.join(imageDir, `${prefix}-${String(index + 1).padStart(2, '0')}.png`),
-    });
+    await saveCanvasPng(
+      page,
+      selector,
+      path.join(imageDir, `${prefix}-${String(index + 1).padStart(2, '0')}.png`),
+    );
   }
 }
 
@@ -260,6 +329,10 @@ async function runJob(browser, key, job) {
     }
   });
   let viewerGlobal;
+  let pagedSettle = null;
+  let canvasVideoPath = null;
+  let canvasCapturePath = null;
+  let canvasNormalization = null;
   if (job.mode === 'local') {
     await fsp.access(job.model);
     await page.addInitScript(() => {
@@ -287,13 +360,29 @@ async function runJob(browser, key, job) {
     await applyTrainingCamera(page, '__lumaPagedViewer', job.camera, true);
     await page.evaluate(() => {
       const viewer = window.__lumaPagedViewer;
-      // Request a denser settled LOD for recorded quality. The interactive UI
-      // can still lower this scale temporarily while the user is dragging.
-      viewer.spark.lodSplatScale = 0.25;
-      viewer.spark.lodRenderScale = 0.75;
-      viewer.requestRender(60);
+      // Capture the fully settled quality profile. lodSplatScale multiplies
+      // Spark's target count, so values below one reduce rather than increase
+      // detail. lodRenderScale below one permits sub-pixel hierarchy nodes.
+      viewer.setQuality('high');
+      viewer.spark.lodSplatScale = 2;
+      viewer.spark.lodRenderScale = 0.35;
+      viewer.requestRender(600);
     });
-    await page.waitForTimeout(10000);
+    pagedSettle = await waitForPagedQuality(page);
+    console.log(`[paged-settle-final] ${JSON.stringify(pagedSettle)}`);
+    // The benchmark follows a small path around one trained camera. Once that
+    // view has reached the requested detail, freeze background prefetch so a
+    // complete local cache cannot open unnecessary requests for every RAD
+    // chunk while video capture is running. Runtime navigation keeps fetching
+    // enabled; this is capture-only stabilization.
+    await page.evaluate(() => {
+      const viewer = window.__lumaPagedViewer;
+      viewer.spark.enableLodFetching = false;
+      viewer.requestRender(30);
+    });
+    // Ignore load-phase transport diagnostics; any error during the measured
+    // camera path is still collected and fails the job below.
+    errors.length = 0;
     viewerGlobal = '__lumaPagedViewer';
   }
 
@@ -311,11 +400,23 @@ async function runJob(browser, key, job) {
     #viewport canvas { width: 100vw !important; height: 100vh !important; }
   ` });
   await page.waitForTimeout(500);
-  await page.screenshot({ path: path.join(imageDir, `${job.name}-initial.png`) });
+  await saveCanvasPng(page, selector, path.join(imageDir, `${job.name}-initial.png`));
+  if (process.env.CAPTURE_CANVAS_MP4 === '1') {
+    canvasVideoPath = path.join(jobDir, `${job.name}.mp4`);
+    canvasCapturePath = path.join(jobDir, `${job.name}_capture.mp4`);
+    const recorder = await startMp4Recorder(page, selector, path.basename(canvasCapturePath));
+    if (!recorder.mimeType.startsWith('video/mp4')) {
+      throw new Error(`MP4 MediaRecorder unavailable; selected ${recorder.mimeType}`);
+    }
+  }
   await startSlowCameraMotion(page, viewerGlobal);
   const keyframes = captureKeyframes(page, selector, imageDir, job.name);
   const metrics = await page.evaluate(() => window.__slowMotionPromise);
   await keyframes;
+  if (canvasVideoPath) {
+    await stopMp4Recorder(page, canvasCapturePath);
+    canvasNormalization = await normalizeMp4Duration(canvasCapturePath, canvasVideoPath, 35, 24);
+  }
   await page.waitForTimeout(500);
   const state = await page.evaluate(viewerGlobal => {
     const viewer = window[viewerGlobal];
@@ -324,6 +425,9 @@ async function runJob(browser, key, job) {
         ? viewer.spark.activeSplats
         : viewer.splatMesh.getSplatCount(),
       maxPagedSplats: viewer.spark?.maxPagedSplats ?? null,
+      paging: viewer.pagingSnapshot?.() ?? null,
+      lodSplatScale: viewer.spark?.lodSplatScale ?? null,
+      lodRenderScale: viewer.spark?.lodRenderScale ?? null,
       pixelRatio: viewer.renderer?.getPixelRatio?.() ?? null,
       uiFps: document.querySelector('#fpsValue')?.textContent?.trim() ?? null,
       fileName: document.querySelector('#fileName')?.textContent?.trim() ?? null,
@@ -338,11 +442,17 @@ async function runJob(browser, key, job) {
     declaredGaussians: job.gaussians,
     modelBytes: job.model ? fs.statSync(job.model).size : null,
     videoBytes: null,
+    canvasVideoBytes: canvasVideoPath ? fs.statSync(canvasVideoPath).size : null,
+    canvasVideoPath,
+    canvasCaptureBytes: canvasCapturePath ? fs.statSync(canvasCapturePath).size : null,
+    canvasCapturePath,
+    canvasNormalization,
     durationSeconds: 35,
     captureFps: 24,
     measuredRenderFps: metrics.fps,
     renderedFrames: metrics.renderedFrames,
     rendererName: metrics.rendererName,
+    pagedSettle,
     ...state,
     errors,
   };
